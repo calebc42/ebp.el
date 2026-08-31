@@ -69,6 +69,14 @@ A pending item is runnable at or after its availability time; a leased item
 is runnable again at or after lease expiry.  Limit the search to PAIRING-ID
 when non-nil.  Return nil or an `ebp-store-work' with a fresh lease ID.")
 
+(cl-defgeneric ebp-store-checkpoint (store work payload-json now-ms)
+  "Lease-check WORK and durably replace its PAYLOAD-JSON in STORE.
+
+NOW-MS becomes the work item's update time.  Return the refreshed leased
+`ebp-store-work'.  This is the recoverable-work cursor seam: application
+workers may checkpoint bounded progress without completing the accepted
+event, releasing its lease, or weakening duplicate suppression.")
+
 (cl-defgeneric ebp-store-complete (store work now-ms)
   "Lease-check WORK, mark its receipt complete, and erase its payload.
 

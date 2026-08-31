@@ -231,6 +231,42 @@
     (setq store (ebp-sqlite-open file))
     (should (= 1 (length (ebp-store-list-work store nil 'blocked))))))
 
+(ert-deftest ebp-sqlite-checkpoint-is-atomic-and-lease-checked ()
+  (ebp-store-test--with-store (store file)
+    (ebp-store-test--admit
+     store ebp-store-test-event-a nil 100 "{\"cursor\":0}")
+    (let* ((work (ebp-store-claim-next store "worker-a" 100 50))
+           (next (ebp-store-checkpoint
+                  store work "{\"cursor\":1}" 110)))
+      (should (equal "{\"cursor\":1}"
+                     (ebp-store-work-payload-json next)))
+      (should (= 110 (ebp-store-work-updated-at-ms next)))
+      (should (equal (ebp-store-work-lease-id work)
+                     (ebp-store-work-lease-id next)))
+      (let ((ebp-sqlite--fault-function
+             (lambda (point)
+               (when (eq point 'after-checkpoint)
+                 (error "Injected checkpoint failure")))))
+        (should-error
+         (ebp-store-checkpoint store next "{\"cursor\":2}" 120)
+         :type 'ebp-store-error))
+      (should
+       (equal "{\"cursor\":1}"
+              (ebp-store-work-payload-json
+               (car (ebp-store-list-work store nil 'leased)))))
+      (ebp-store-close store)
+      (setq store (ebp-sqlite-open file))
+      (should
+       (equal "{\"cursor\":1}"
+              (ebp-store-work-payload-json
+               (car (ebp-store-list-work store nil 'leased)))))
+      (let ((reclaimed (ebp-store-claim-next store "worker-b" 150 50)))
+        (should-error
+         (ebp-store-checkpoint store next "{\"stale\":true}" 151)
+         :type 'ebp-store-stale-lease)
+        (should (equal "{\"cursor\":1}"
+                       (ebp-store-work-payload-json reclaimed)))))))
+
 (ert-deftest ebp-sqlite-completion-is-atomic-and-erases-work-payload ()
   (ebp-store-test--with-store (store file)
     (ebp-store-test--admit

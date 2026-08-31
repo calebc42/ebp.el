@@ -435,6 +435,34 @@
                (stringp (ebp-store-work-lease-id work)))
     (signal 'wrong-type-argument (list 'ebp-leased-work work))))
 
+(cl-defmethod ebp-store-checkpoint
+  ((store ebp-sqlite-store) work payload-json now-ms)
+  (ebp-sqlite--require-leased-work work)
+  (unless (stringp payload-json)
+    (signal 'wrong-type-argument (list 'stringp payload-json)))
+  (ebp-sqlite--require-time now-ms 'ebp-now-ms)
+  (let ((db (ebp-sqlite--db store)))
+    (ebp-sqlite--call-with-transaction
+     store
+     (lambda ()
+       (unless
+           (= 1
+              (sqlite-execute
+               db
+               "UPDATE action_work
+                   SET payload_json = ?, updated_at_ms = ?
+                 WHERE work_id = ? AND pairing_id = ? AND event_id = ?
+                   AND state = 'leased' AND lease_id = ?"
+               (list payload-json now-ms
+                     (ebp-store-work-work-id work)
+                     (ebp-store-work-pairing-id work)
+                     (ebp-store-work-event-id work)
+                     (ebp-store-work-lease-id work))))
+         (signal 'ebp-store-stale-lease '("Work lease is no longer current")))
+       (ebp-sqlite--fault 'after-checkpoint)
+       (ebp-sqlite--select-work-by-id
+        db (ebp-store-work-work-id work))))))
+
 (cl-defmethod ebp-store-complete
   ((store ebp-sqlite-store) work now-ms)
   (ebp-sqlite--require-leased-work work)

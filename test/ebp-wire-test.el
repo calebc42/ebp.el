@@ -18,10 +18,13 @@
 (defconst ebp-test--root
   (expand-file-name ".." (file-name-directory
                           (or load-file-name buffer-file-name)))
-  "llm-poc-3 checkout root.")
+  "ebp.el checkout root.")
 
-(defconst ebp-test--ebp (expand-file-name "ebp" ebp-test--root)
-  "The ebp submodule: spec, contract, goldens.")
+(defconst ebp-test--ebp
+  (file-truename
+   (or (getenv "EBP_SPEC_DIR")
+       (expand-file-name "../ebp" ebp-test--root)))
+  "Canonical EBP specification checkout: contract and conformance goldens.")
 
 (defun ebp-test--read-bytes (path)
   "Unibyte contents of PATH."
@@ -1032,16 +1035,18 @@ reset for this revision and adopts a draft the snapshot supersedes
 
 (ert-deftest ebp-test-transport-coding-is-pinned ()
   "A8/3-c: `ebp-connect' pins `:coding utf-8-unix' and MUST keep doing so.
-Left unpinned, `undecided' latches `undecided-dos', which strips the CR
+On Emacs 30.1, left unpinned, `undecided' latched `undecided-dos', stripping the CR
 from the `\\r\\n\\r\\n' terminator; jsonrpc.el's header search
 \(emacs-30.1 jsonrpc.el:740-744) matches a literal CRLF, so it never
 fires.  There is no error, no close, and no diagnostic — the connection
 simply never dispatches again, which is exactly the unbounded stall
 amendment #91 ruled out as a conforming alternative.
 
-Pairs with `ebp-test-live-socket-carries-non-ascii', which guards the
-other half (`binary' over-counts a non-ASCII body via `position-bytes')."
-  (dolist (probe '((utf-8-unix . t) (undecided . nil)))
+Pairs with `ebp-test-live-socket-carries-non-ascii'.  Negative ambient-coding
+behavior is version-specific; the pinned UTF-8 behavior is the contract."
+  ;; Emacs 31 changed the unpinned `undecided' failure mode.  Keep the
+  ;; portable invariant: the explicitly pinned path must decode and dispatch.
+  (dolist (probe '((utf-8-unix . t)))
     (let* ((coding (car probe))
            (expect (cdr probe))
            (got nil)
@@ -1069,11 +1074,8 @@ other half (`binary' over-counts a non-ASCII body via `position-bytes')."
           (progn
             (process-send-string proc "hi")
             (dotimes (_ 30) (accept-process-output nil 0.05))
-            (if expect
-                (should (equal got '((probe.note (:n 1)))))
-              ;; Pin the failure mode too, so the docstring stays true.
-              (should (eq (car (process-coding-system proc)) 'undecided-dos))
-              (should-not got)))
+            (should expect)
+            (should (equal got '((probe.note (:n 1))))))
         (ignore-errors (delete-process proc))
         (ignore-errors (delete-process server))))))
 
@@ -1288,13 +1290,15 @@ data.kind event-retry surviving jsonrpc.el's reply path."
 (ert-deftest ebp-test-live-socket-carries-non-ascii ()
   "The live connection must decode a non-ASCII body.
 `ebp-connect' pins `:coding utf-8-unix'.  `binary' looks right (SPEC 6
-counts OCTETS) but is wrong here: jsonrpc.el's process buffer is
+counts OCTETS) but was wrong under Emacs 30.1: jsonrpc.el's process buffer is
 multibyte and `jsonrpc--process-filter' sizes the body with
 `position-bytes', so a unibyte insert makes every octet >= 0x80 a
 2-internal-byte raw char, the length arithmetic over-counts, and the
-frame is silently dropped.  Every other wire test is ASCII-only, so
-this is the only guard on that regression."
-  (dolist (probe '((utf-8-unix . t) (binary . nil)))
+frame is silently dropped.  Emacs 31 fixed that negative probe; this test
+guards exact Unicode delivery through the portable pinned path."
+  ;; Emacs 31's jsonrpc.el also accepts the former `binary' failure probe.
+  ;; The cross-version contract is exact delivery on the pinned UTF-8 path.
+  (dolist (probe '((utf-8-unix . t)))
     (let* ((coding (car probe))
            (expect (cdr probe))
            (got nil)
@@ -1324,10 +1328,8 @@ this is the only guard on that regression."
           (progn
             (process-send-string proc "hi")
             (dotimes (_ 30) (accept-process-output nil 0.05))
-            (if expect
-                (should (equal got '((probe.note (:text "café")))))
-              ;; Pin the failure mode too, so the comment above stays true.
-              (should-not got)))
+            (should expect)
+            (should (equal got '((probe.note (:text "café"))))))
         (ignore-errors (jsonrpc-shutdown conn))
         (ignore-errors (delete-process server))))))
 

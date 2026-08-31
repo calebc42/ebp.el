@@ -2,18 +2,15 @@
 
 ;;; Commentary:
 
-;; The JC-5 exit gate (docs/PLAN-jetpacs-consumers.md, JC-5 section).
-;; The harvester tests call `ebp-complete--collect' /
+;; The canonical Emacs completion implementation gate.  The harvester tests
+;; call `ebp-complete--collect' /
 ;; `ebp-complete-in-text' directly; the seam tests drive ebp's REAL
 ;; `ebp-client--handle-edit-complete' with the harvester registered, so
 ;; the session/seq gate, the 1201 refusal, and the reply shape are the
 ;; live ones, not a mock's.
 ;;
-;; ebp-complete.el itself needs only `cl-lib'; the jetpacs and ebp-sync
-;; requires below are this SUITE's — jetpacs for the one test pinning
-;; `jetpacs-connect' installing the harvester through its `fboundp'
-;; seam, ebp-sync for the R0 live-buffer arm, which routes through the
-;; real attach table.
+;; `ebp-sync' supplies the live-buffer arm and routes through the real attach
+;; table.  Product-specific connect wiring is tested by the consuming product.
 
 ;;; Code:
 
@@ -21,9 +18,6 @@
 (require 'cl-lib)
 (require 'ebp)
 (require 'ebp-sync)
-(require 'jetpacs-widgets)
-(require 'jetpacs-async)
-(require 'jetpacs-surfaces)
 (require 'ebp-complete)
 
 ;; Interned completion targets for the elisp-capf tests: the shadow for
@@ -183,7 +177,9 @@ matching nothing gets `fundamental-mode'."
   (let* ((contract (json-parse-string
                     (with-temp-buffer
                       (insert-file-contents
-                       (expand-file-name "ebp/contract.json"))
+                       (expand-file-name
+                        "contract.json"
+                        (or (getenv "EBP_SPEC_DIR") "../ebp")))
                       (buffer-string))
                     :object-type 'alist :array-type 'list))
          (enum (alist-get 'kind_enum
@@ -1006,30 +1002,6 @@ reply, and the stale refusal (1201) BEFORE the harvester is consulted."
                        client '(:document "notes.el" :editor_id "body"
                                 :session "S1" :seq 99 :cursor 33)))
         (should-not ran)))))
-
-(ert-deftest ebp-complete-connect-installs-the-default ()
-  "`jetpacs-connect' wires the harvester as the client-wide completion
-answer when the caller supplied nothing; an explicit value wins."
-  (cl-letf (((symbol-function 'ebp-connect)
-             (lambda (_host _port &rest config)
-               (apply #'ebp-client-create config))))
-    (let ((client (jetpacs-connect
-                   "127.0.0.1" 0
-                   :receipt-file (make-temp-file "jc5-connect-a"))))
-      (unwind-protect
-          (should (eq (plist-get (ebp-client-config client)
-                                 :edit-complete-function)
-                      #'ebp-complete-edit-complete))
-        (jetpacs-detach) (jetpacs-test-reset-state)))
-    (let ((client (jetpacs-connect
-                   "127.0.0.1" 0
-                   :receipt-file (make-temp-file "jc5-connect-b")
-                   :edit-complete-function #'ignore)))
-      (unwind-protect
-          (should (eq (plist-get (ebp-client-config client)
-                                 :edit-complete-function)
-                      #'ignore))
-        (jetpacs-detach) (jetpacs-test-reset-state)))))
 
 (provide 'ebp-complete-test)
 ;;; ebp-complete-test.el ends here

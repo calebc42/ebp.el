@@ -6,15 +6,15 @@
 ;;; Commentary:
 
 ;; The Emacs-side wire core for the Emacs Bridge Protocol, written against
-;; ebp/SPEC.md (protocol 3, document 3.1.0-draft).  Rung W1 of
-;; docs/REWRITE-PLAN.md: framing (SPEC 6), envelope conventions (SPEC 7),
+;; the neighboring ebp/SPEC.md (protocol 3, document 3.1.0-draft): framing
+;; (SPEC 6), envelope conventions (SPEC 7),
 ;; the JSON data-model receiver rules this layer owns (SPEC 4.1),
 ;; pairing/proof construction (SPEC 9), and a pure client session state
 ;; machine and reconnect lifecycle (SPEC 5.2, 10.1).  Transport wiring is
 ;; generic EBP endpoint behavior; no Jetpacs application policy lives here.
 ;;
 ;; Every function cites the section it implements.  Behavior with no
-;; section is a bug in this file or an amendment owed to ebp/.
+;; section is a bug in this file or an amendment owed to the EBP spec.
 
 ;;; Code:
 
