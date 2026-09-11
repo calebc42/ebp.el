@@ -10,6 +10,12 @@
 ;; EventId receipt and its durable work item in one BEGIN IMMEDIATE
 ;; transaction.  Application work always runs outside that transaction.
 ;;
+;; One prior on-disk format shipped: an unversioned flat table
+;; `receipts (event_id TEXT PRIMARY KEY, ts REAL)', process-wide and not
+;; partitioned by pairing.  `ebp-sqlite-open' migrates such a file in
+;; place, atomically, into schema version 1 under the caller-supplied
+;; adopting pairing partition; no other unversioned layout is adopted.
+;;
 ;; Emacs 30.1's `with-sqlite-transaction' can return the body value after a
 ;; false `sqlite-commit' result, so this backend intentionally uses a small
 ;; checked wrapper over the public SQLite primitives instead.
@@ -135,23 +141,15 @@
                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"))
         #'string<))
 
-(defun ebp-sqlite--create-schema (store)
-  "Create STORE's complete schema version 1 in one transaction."
-  (let ((db (ebp-sqlite--db store)))
-    (ebp-sqlite--call-with-transaction
-     store
-     (lambda ()
-       (sqlite-execute
-        db
-        "CREATE TABLE pairing_partitions (
+(defconst ebp-sqlite--schema-ddl
+  (list
+   "CREATE TABLE pairing_partitions (
            pairing_id TEXT PRIMARY KEY NOT NULL,
            created_at_ms INTEGER NOT NULL,
            CHECK (length(pairing_id) = 32
                   AND pairing_id NOT GLOB '*[^0-9a-f]*')
-         )")
-       (sqlite-execute
-        db
-        "CREATE TABLE accepted_events (
+         )"
+   "CREATE TABLE accepted_events (
            pairing_id TEXT NOT NULL,
            event_id TEXT NOT NULL,
            accepted_at_ms INTEGER NOT NULL,
@@ -161,10 +159,8 @@
              REFERENCES pairing_partitions(pairing_id) ON DELETE CASCADE,
            CHECK (length(event_id) = 32
                   AND event_id NOT GLOB '*[^0-9a-f]*')
-         )")
-       (sqlite-execute
-        db
-        "CREATE TABLE action_work (
+         )"
+   "CREATE TABLE action_work (
            work_id INTEGER PRIMARY KEY AUTOINCREMENT,
            pairing_id TEXT NOT NULL,
            event_id TEXT NOT NULL,
@@ -187,11 +183,27 @@
                   OR
                   (state <> 'leased'
                    AND lease_id IS NULL AND lease_until_ms IS NULL))
-         )")
-       (sqlite-execute
-        db
-        "CREATE INDEX action_work_ready
+         )"
+   "CREATE INDEX action_work_ready
            ON action_work(state, available_at_ms, work_id)")
+  "Schema version 1's table and index DDL, in dependency order.")
+
+(defconst ebp-sqlite--legacy-receipts-tables '("receipts")
+  "The complete user-table list of the shipped pre-v1 flat receipt store.")
+
+(defun ebp-sqlite--install-schema-tables (db)
+  "Create schema version 1's tables and indexes in DB.
+The caller owns the transaction and the `user_version' stamp."
+  (dolist (statement ebp-sqlite--schema-ddl)
+    (sqlite-execute db statement)))
+
+(defun ebp-sqlite--create-schema (store)
+  "Create STORE's complete schema version 1 in one transaction."
+  (let ((db (ebp-sqlite--db store)))
+    (ebp-sqlite--call-with-transaction
+     store
+     (lambda ()
+       (ebp-sqlite--install-schema-tables db)
        (sqlite-execute db "PRAGMA user_version = 1")
        t))))
 
@@ -205,12 +217,70 @@
   (when (sqlite-select db "PRAGMA foreign_key_check")
     (signal 'ebp-store-error '("SQLite EBP foreign-key check failed"))))
 
-(defun ebp-sqlite-open (file)
-  "Open FILE as a versioned, fail-closed `ebp-sqlite-store'."
+(defun ebp-sqlite--migrate-legacy-receipts (store pairing-id)
+  "Migrate STORE's flat pre-v1 `receipts' table into PAIRING-ID's partition.
+
+One checked transaction does everything: the malformed-row pre-check, the
+version 1 schema, PAIRING-ID's partition row, the receipt import, the drop
+of the legacy table, and the `user_version' stamp.  A failure anywhere
+rolls the file back to its unversioned pre-v1 state, so a caller that
+retries after the cause is fixed sees the same starting point.
+
+Every imported receipt is recorded as accepted AND completed at its legacy
+timestamp: the pre-v1 writer only ever stored ids whose application effect
+had already run inside the dispatch (SPEC 14.4).  A row that does not match
+what that writer could produce is corruption, and SPEC 3.3/3.4 require
+failing closed rather than silently dropping an accepted commitment."
+  (let ((db (ebp-sqlite--db store))
+        (now-ms (floor (* 1000 (float-time)))))
+    (ebp-sqlite--call-with-transaction
+     store
+     (lambda ()
+       (unless (= 0 (ebp-sqlite--scalar
+                     db
+                     "SELECT COUNT(*) FROM receipts
+                       WHERE event_id IS NULL
+                          OR ts IS NULL
+                          OR typeof(ts) NOT IN ('integer', 'real')
+                          OR ts < 0
+                          OR NOT (length(event_id) = 32
+                                  AND event_id NOT GLOB '*[^0-9a-f]*')"))
+         (signal 'ebp-store-error
+                 '("Legacy receipt store holds malformed rows")))
+       (ebp-sqlite--install-schema-tables db)
+       ;; Foreign keys are ON, so the adopting partition must exist first.
+       (sqlite-execute
+        db
+        "INSERT INTO pairing_partitions (pairing_id, created_at_ms)
+           VALUES (?, ?)"
+        (list pairing-id now-ms))
+       (sqlite-execute
+        db
+        "INSERT INTO accepted_events
+           (pairing_id, event_id, accepted_at_ms, completed_at_ms)
+           SELECT ?, event_id, CAST(ts * 1000 AS INTEGER),
+                  CAST(ts * 1000 AS INTEGER)
+             FROM receipts"
+        (list pairing-id))
+       (ebp-sqlite--fault 'after-legacy-import)
+       (sqlite-execute db "DROP TABLE receipts")
+       ;; A transactional header field: a rollback restores version 0.
+       (sqlite-execute db "PRAGMA user_version = 1")
+       t))))
+
+(defun ebp-sqlite-open (file &optional legacy-pairing-id)
+  "Open FILE as a versioned, fail-closed `ebp-sqlite-store'.
+
+LEGACY-PAIRING-ID names the partition that adopts an unversioned pre-v1
+flat `receipts' table found at FILE; without it such a file is refused.
+Migration is atomic and in place, and no other unversioned non-empty
+layout is ever adopted."
   (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
     (signal 'ebp-store-unavailable '("Emacs was built without SQLite")))
   (unless (stringp file)
     (signal 'wrong-type-argument (list 'stringp file)))
+  (when legacy-pairing-id
+    (ebp-sqlite--require-id legacy-pairing-id 'ebp-pairing-id))
   (let* ((path (expand-file-name file))
          (directory (file-name-directory path)))
     (unless (and directory (file-directory-p directory))
@@ -231,10 +301,17 @@
               (let ((version (ebp-sqlite--scalar db "PRAGMA user_version")))
                 (cond
                  ((= version 0)
-                  (when (ebp-sqlite--user-tables db)
-                    (signal 'ebp-store-error
-                            '("Unversioned non-empty SQLite store refused")))
-                  (ebp-sqlite--create-schema store))
+                  (let ((tables (ebp-sqlite--user-tables db)))
+                    (cond
+                     ((null tables) (ebp-sqlite--create-schema store))
+                     ((and legacy-pairing-id
+                           (equal tables ebp-sqlite--legacy-receipts-tables))
+                      (ebp-sqlite--migrate-legacy-receipts
+                       store legacy-pairing-id))
+                     (t
+                      (signal
+                       'ebp-store-error
+                       '("Unversioned non-empty SQLite store refused"))))))
                  ((/= version ebp-sqlite-schema-version)
                   (signal 'ebp-store-error
                           (list (format "Unsupported SQLite EBP schema %s"
@@ -321,14 +398,24 @@
                           (list work-id)))))
     (ebp-sqlite--row-to-work row)))
 
+(defun ebp-sqlite--select (db query &optional values)
+  "Run QUERY on DB outside a transaction, failing as `ebp-store-error'.
+The transaction wrapper converts a `sqlite-error' for every write; a
+read-only query has no transaction to convert it, so the contract's
+\"storage failures are `ebp-store-error'\" rule is honored here instead.
+The handle stays valid: a failed query says nothing about the store."
+  (condition-case err
+      (sqlite-select db query values)
+    (sqlite-error (ebp-sqlite--signal-error "SQLite query failed" err))))
+
 (cl-defmethod ebp-store-known-p
   ((store ebp-sqlite-store) pairing-id event-id)
   (ebp-sqlite--require-id pairing-id 'ebp-pairing-id)
   (ebp-sqlite--require-id event-id 'ebp-event-id)
-  (and (sqlite-select (ebp-sqlite--db store)
-                      "SELECT 1 FROM accepted_events
-                        WHERE pairing_id = ? AND event_id = ? LIMIT 1"
-                      (list pairing-id event-id))
+  (and (ebp-sqlite--select (ebp-sqlite--db store)
+                           "SELECT 1 FROM accepted_events
+                             WHERE pairing_id = ? AND event_id = ? LIMIT 1"
+                           (list pairing-id event-id))
        t))
 
 (cl-defmethod ebp-store-admit
@@ -374,6 +461,36 @@
              (signal 'ebp-store-error
                      '("Work insertion affected an unexpected row count")))
            (ebp-sqlite--fault 'after-work)
+           'admitted)))))))
+
+(cl-defmethod ebp-store-admit-completed
+  ((store ebp-sqlite-store) pairing-id event-id now-ms)
+  (ebp-sqlite--require-id pairing-id 'ebp-pairing-id)
+  (ebp-sqlite--require-id event-id 'ebp-event-id)
+  (ebp-sqlite--require-time now-ms 'ebp-now-ms)
+  (let ((db (ebp-sqlite--db store)))
+    (ebp-sqlite--call-with-transaction
+     store
+     (lambda ()
+       (sqlite-execute
+        db
+        "INSERT OR IGNORE INTO pairing_partitions
+           (pairing_id, created_at_ms) VALUES (?, ?)"
+        (list pairing-id now-ms))
+       (let ((inserted
+              (sqlite-execute
+               db
+               "INSERT OR IGNORE INTO accepted_events
+                  (pairing_id, event_id, accepted_at_ms, completed_at_ms)
+                  VALUES (?, ?, ?, ?)"
+               (list pairing-id event-id now-ms now-ms))))
+         (cond
+          ((= inserted 0) 'duplicate)
+          ((/= inserted 1)
+           (signal 'ebp-store-error
+                   '("Receipt insertion affected an unexpected row count")))
+          (t
+           (ebp-sqlite--fault 'after-completed-receipt)
            'admitted)))))))
 
 (cl-defmethod ebp-store-claim-next
@@ -562,7 +679,7 @@
       (setq values (append values (list state-name))))
     (mapcar
      #'ebp-sqlite--row-to-work
-     (sqlite-select
+     (ebp-sqlite--select
       (ebp-sqlite--db store)
       (concat "SELECT " ebp-sqlite--work-columns
               " FROM action_work w

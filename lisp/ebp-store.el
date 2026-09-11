@@ -10,11 +10,15 @@
 ;; operations only.  It deliberately knows nothing about SQLite, files,
 ;; JSON-RPC, Jetpacs, UI policy, or application effects.
 ;;
-;; An admitted event owns exactly one durable work item.  A backend must
-;; commit the receipt and work atomically before returning `admitted'.  A
-;; completed work item is removed while its receipt remains available for
-;; duplicate suppression.  Work that cannot safely proceed remains durable;
-;; there is no terminal state that silently discards an accepted effect.
+;; Admission has two arms.  In the work-item arm (`ebp-store-admit') an
+;; admitted event owns exactly one durable work item: a backend must commit
+;; the receipt and work atomically before returning `admitted'.  In the
+;; completed-effect arm (`ebp-store-admit-completed') the application effect
+;; already ran inside the dispatch, so the receipt alone is the commitment
+;; and no work item is created.  A completed work item is removed while its
+;; receipt remains available for duplicate suppression.  Work that cannot
+;; safely proceed remains durable; there is no terminal state that silently
+;; discards an accepted effect.
 
 ;;; Code:
 
@@ -60,6 +64,16 @@ input.  NOW-MS is a caller-supplied local timestamp for deterministic tests.
 Return exactly `admitted' after receipt and work commit, or `duplicate' when
 the pairing already owns EVENT-ID.  Signal `ebp-store-error' for every
 storage ambiguity or failure.")
+
+(cl-defgeneric ebp-store-admit-completed (store pairing-id event-id now-ms)
+  "Atomically record EVENT-ID for PAIRING-ID as accepted and already complete.
+
+The SPEC 14.4 \"completed application effect\" arm: the effect ran inside
+the dispatch, the receipt is the commitment.  Creates no work item.
+
+Return exactly `admitted' after the receipt commits, or `duplicate' when the
+pairing already owns EVENT-ID (with or without work).  Signal
+`ebp-store-error' for every storage ambiguity or failure.")
 
 (cl-defgeneric ebp-store-claim-next
     (store worker-id now-ms lease-ms &optional pairing-id)
