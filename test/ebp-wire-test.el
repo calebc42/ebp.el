@@ -902,7 +902,8 @@ duplicate without repeating the effect; unregistered actions reject."
 (ert-deftest ebp-test-event-action-duplicate-after-restart ()
   "SPEC 24.6 item 9: duplicate delivery after Emacs restart returns
 duplicate from the durable receipt store, without the handler running."
-  (let* ((receipt-file (make-temp-file "ebp-receipts"))
+  (let* ((directory (make-temp-file "ebp-test-restart-" t))
+         (receipt-file (expand-file-name "receipts.sqlite" directory))
          (event-id (make-string 32 ?c))
          (runs 0))
     (unwind-protect
@@ -935,7 +936,298 @@ duplicate from the durable receipt store, without the handler running."
                                                  (ebp-test--response-for server 301)))
                            "duplicate"))
             (should (= runs 1))))
-      (delete-file receipt-file))))
+      ;; `delete-directory' also takes the WAL sidecars with it.
+      (delete-directory directory t))))
+
+;;; The durable receipt store seam (SPEC 14.4), off the wire.
+
+(defun ebp-test--store-client (&rest config)
+  "Create a READY client for the receipt-store tests.
+`ebp-client--force-replay-retry' only arms its SPEC 15.3 timer in READY,
+which is the state a real `event.action' always arrives in."
+  (let ((client (apply #'ebp-client-create config)))
+    (setf (ebp-client-state client) 'ready)
+    client))
+
+(defun ebp-test--dispatch-code (client params)
+  "The `jsonrpc-error' code `event.action' answers PARAMS with."
+  (let ((err (should-error (ebp-client--handle-event-action client params)
+                           :type 'jsonrpc-error)))
+    (alist-get 'jsonrpc-error-code (cdr err))))
+
+(defun ebp-test--write-legacy-receipts (file rows)
+  "Write the shipped pre-v1 flat receipt store at FILE holding ROWS.
+Each row is a cons (EVENT-ID . TS)."
+  (let ((db (sqlite-open file)))
+    (unwind-protect
+        (progn
+          (sqlite-execute
+           db "CREATE TABLE receipts (event_id TEXT PRIMARY KEY, ts REAL)")
+          (dolist (row rows)
+            (sqlite-execute db "INSERT INTO receipts VALUES (?, ?)"
+                            (list (car row) (cdr row)))))
+      (sqlite-close db))))
+
+(ert-deftest ebp-test-event-action-no-store-answers-1500-before-handler ()
+  "No durable store, no commitment: SPEC 14.4's `accepted' is unreachable,
+so `event.action' answers 1500 event-retry immediately after envelope
+validation and the handler never runs."
+  (let* ((runs 0)
+         (client (ebp-test--store-client
+                  :receipt-file "/nonexistent-ebp-dir/receipts"
+                  :pairing-id ebp-test--kat-pid)))
+    (unwind-protect
+        (progn
+          (should-not (ebp-client-store client))
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+          (should (equal 1500
+                         (ebp-test--dispatch-code
+                          client (ebp-test--event-params
+                                  (make-string 32 ?a)))))
+          (should (= runs 0))
+          ;; SPEC 15.3: the replay that unpauses the pump was forced.
+          (should (timerp (ebp-client-replay-retry-timer client))))
+      (when-let* ((tm (ebp-client-replay-retry-timer client)))
+        (cancel-timer tm)))))
+
+(ert-deftest ebp-test-event-action-no-store-unregistered-action-also-retries ()
+  "The intentional consequence of answering 1500 before the allowlist:
+an unregistered action with no store is 1500, not `rejected'.  Rejection
+is permanent; 1500 is the conservative answer while the store is down."
+  (let ((client (ebp-test--store-client
+                 :receipt-file "/nonexistent-ebp-dir/receipts"
+                 :pairing-id ebp-test--kat-pid)))
+    (unwind-protect
+        (should (equal 1500
+                       (ebp-test--dispatch-code
+                        client (ebp-test--event-params
+                                (make-string 32 ?a) "no.handler"))))
+      (when-let* ((tm (ebp-client-replay-retry-timer client)))
+        (cancel-timer tm)))))
+
+(ert-deftest ebp-test-receipt-store-opens-zero-byte-file ()
+  "Every fixture hands the client a `make-temp-file' path: a zero-byte
+file is an EMPTY database that takes the create path, not an unversioned
+stranger the store must refuse."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let ((file (make-temp-file "ebp-test-zero-byte-")))
+    (unwind-protect
+        (progn
+          (should (= 0 (file-attribute-size (file-attributes file))))
+          (let ((client (ebp-client-create :receipt-file file
+                                           :pairing-id ebp-test--kat-pid)))
+            (should (ebp-sqlite-store-p (ebp-client-store client)))
+            (should (= 1 (caar (sqlite-select
+                                (ebp-sqlite-store-db
+                                 (ebp-client-store client))
+                                "PRAGMA user_version"))))
+            (ebp-client-close client 'test-done)))
+      (dolist (f (list file (concat file "-wal") (concat file "-shm")))
+        (when (file-exists-p f) (delete-file f))))))
+
+(ert-deftest ebp-test-event-known-p-predicate ()
+  "`ebp-client-event-known-p' answers the durable store and never signals:
+nil with no store and nil for a malformed id are NOT proof of absence."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-known-p-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (event-id (make-string 32 ?a))
+         (client (ebp-test--store-client :receipt-file file
+                                         :pairing-id ebp-test--kat-pid)))
+    (unwind-protect
+        (progn
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) 'accepted))
+          (should-not (ebp-client-event-known-p client event-id))
+          (should (equal '(:status "accepted")
+                         (ebp-client--handle-event-action
+                          client (ebp-test--event-params event-id))))
+          (should (ebp-client-event-known-p client event-id))
+          (should-not (ebp-client-event-known-p client (make-string 32 ?b)))
+          (should-not (ebp-client-event-known-p client "not-an-event-id"))
+          (ebp-client-close client 'test-done)
+          ;; Slot cleared by the close: no store, no knowledge.
+          (should-not (ebp-client-store client))
+          (should-not (ebp-client-event-known-p client event-id)))
+      (ignore-errors (ebp-client-close client 'test-done))
+      (delete-directory directory t))))
+
+(ert-deftest ebp-test-unpaired-client-uses-synthetic-partition ()
+  "A client with no pairing identity has no partition of its own, so its
+receipts live in the synthetic all-zero one rather than some pairing's."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-unpaired-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (event-id (make-string 32 ?a))
+         (runs 0)
+         (client (ebp-test--store-client :receipt-file file)))
+    (unwind-protect
+        (progn
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+          (should (equal '(:status "accepted")
+                         (ebp-client--handle-event-action
+                          client (ebp-test--event-params event-id))))
+          (should (ebp-store-known-p (ebp-client-store client)
+                                     ebp--unpaired-partition event-id))
+          (should (equal '(:status "duplicate")
+                         (ebp-client--handle-event-action
+                          client (ebp-test--event-params event-id))))
+          (should (= runs 1)))
+      (ignore-errors (ebp-client-close client 'test-done))
+      (delete-directory directory t))))
+
+(ert-deftest ebp-test-receipts-are-partitioned-by-pairing ()
+  "SPEC 14.4 scopes EventId uniqueness to the pairing: one store file
+serves two pairings, and the SAME id is a fresh event for the second."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-partitions-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (event-id (make-string 32 ?a))
+         (client-a (ebp-test--store-client :receipt-file file
+                                           :pairing-id (make-string 32 ?1)))
+         (client-b (ebp-test--store-client :receipt-file file
+                                           :pairing-id (make-string 32 ?2))))
+    (unwind-protect
+        (progn
+          (dolist (c (list client-a client-b))
+            (ebp-client-register-action
+             c "demo.count" (lambda (_c _p) 'accepted)))
+          (should (equal '(:status "accepted")
+                         (ebp-client--handle-event-action
+                          client-a (ebp-test--event-params event-id))))
+          (should (equal '(:status "accepted")
+                         (ebp-client--handle-event-action
+                          client-b (ebp-test--event-params event-id))))
+          (should (equal '(:status "duplicate")
+                         (ebp-client--handle-event-action
+                          client-a (ebp-test--event-params event-id)))))
+      (ignore-errors (ebp-client-close client-a 'test-done))
+      (ignore-errors (ebp-client-close client-b 'test-done))
+      (delete-directory directory t))))
+
+(ert-deftest ebp-test-legacy-receipt-file-migrates-on-create ()
+  "The shipped pre-v1 flat receipt file becomes a v1 partitioned store on
+the next `ebp-client-create', and its receipts keep suppressing repeats."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-legacy-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (event-id (make-string 32 ?a))
+         (runs 0))
+    (unwind-protect
+        (progn
+          ;; A timestamp INSIDE the SPEC 14.4 retention window: the
+          ;; store-open prune runs right after the migration, and a
+          ;; genuinely old receipt is legitimately pruned then.
+          (ebp-test--write-legacy-receipts
+           file (list (cons event-id (float-time))))
+          (let ((client (ebp-test--store-client
+                         :receipt-file file
+                         :pairing-id ebp-test--kat-pid)))
+            (ebp-client-register-action
+             client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+            (should (ebp-sqlite-store-p (ebp-client-store client)))
+            (let ((db (ebp-sqlite-store-db (ebp-client-store client))))
+              (should (= 1 (caar (sqlite-select db "PRAGMA user_version"))))
+              (should-not
+               (sqlite-select
+                db "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name = 'receipts'")))
+            (should (ebp-client-event-known-p client event-id))
+            (should (equal '(:status "duplicate")
+                           (ebp-client--handle-event-action
+                            client (ebp-test--event-params event-id))))
+            (should (= runs 0))
+            (ebp-client-close client 'test-done)))
+      (delete-directory directory t))))
+
+(ert-deftest ebp-test-store-failure-mid-session-maps-to-1500 ()
+  "A store that fails after the session opened raises `ebp-store-error',
+never a raw `sqlite-error': the dispatcher answers 1500 event-retry and
+the handler does not run."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-midfail-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (runs 0)
+         (client (ebp-test--store-client :receipt-file file
+                                         :pairing-id ebp-test--kat-pid)))
+    (unwind-protect
+        (progn
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+          (ebp-sqlite--invalidate (ebp-client-store client))
+          (should (equal 1500
+                         (ebp-test--dispatch-code
+                          client (ebp-test--event-params
+                                  (make-string 32 ?a)))))
+          (should (= runs 0))
+          (should (timerp (ebp-client-replay-retry-timer client))))
+      (when-let* ((tm (ebp-client-replay-retry-timer client)))
+        (cancel-timer tm))
+      (ignore-errors (ebp-client-close client 'test-done))
+      (delete-directory directory t))))
+
+(ert-deftest ebp-test-live-store-query-failure-maps-to-1500 ()
+  "The other half of the mid-session failure: a LIVE handle whose query
+fails.  The duplicate check has no transaction wrapper to convert for it,
+so `ebp-sqlite' maps the `sqlite-error' itself — without that, a raw
+`sqlite-error' escapes the dispatcher and jsonrpc.el answers -32603 with
+no data.kind instead of the retryable 1500, and `ebp-client-event-known-p'
+signals in defiance of its own docstring."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-livefail-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (event-id (make-string 32 ?a))
+         (runs 0)
+         (client (ebp-test--store-client :receipt-file file
+                                         :pairing-id ebp-test--kat-pid)))
+    (unwind-protect
+        (progn
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+          (cl-letf (((symbol-function 'sqlite-select)
+                     (lambda (&rest _)
+                       (signal 'sqlite-error '("disk I/O error")))))
+            (should (equal 1500
+                           (ebp-test--dispatch-code
+                            client (ebp-test--event-params event-id))))
+            (should (= runs 0))
+            (should (timerp (ebp-client-replay-retry-timer client)))
+            ;; The predicate answers nil rather than signaling.
+            (should-not (ebp-client-event-known-p client event-id)))
+          ;; The store was not invalidated by the failed query.
+          (should-not (ebp-sqlite-store-closed-p (ebp-client-store client)))
+          (should-not (ebp-client-event-known-p client event-id)))
+      (when-let* ((tm (ebp-client-replay-retry-timer client)))
+        (cancel-timer tm))
+      (ignore-errors (ebp-client-close client 'test-done))
+      (delete-directory directory t))))
+
+(ert-deftest ebp-test-accepted-never-leaves-without-committed-row ()
+  "SPEC 14.4: no commitment, no `accepted'.  A commit that quietly fails
+answers 1500 event-retry, and no receipt survives to suppress the retry."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-nocommit-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (event-id (make-string 32 ?a))
+         (runs 0)
+         (client (ebp-test--store-client :receipt-file file
+                                         :pairing-id ebp-test--kat-pid)))
+    (unwind-protect
+        (progn
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+          (cl-letf (((symbol-function 'sqlite-commit) (lambda (_db) nil)))
+            (should (equal 1500
+                           (ebp-test--dispatch-code
+                            client (ebp-test--event-params event-id)))))
+          (should (= runs 1))
+          (should-not (ebp-client-event-known-p client event-id)))
+      (when-let* ((tm (ebp-client-replay-retry-timer client)))
+        (cancel-timer tm))
+      (ignore-errors (ebp-client-close client 'test-done))
+      (delete-directory directory t))))
 
 (ert-deftest ebp-test-event-action-malformed-is-invalid-params ()
   "SPEC 7.3: structurally invalid request params receive -32602."
@@ -1578,20 +1870,38 @@ the omission is surfaced, never silent."
         (should (= (length (plist-get (cdar sent) :triggers)) 0))))))
 
 (ert-deftest ebp-test-forget-pairing ()
-  "SPEC 9.1 / amendment #72: local pairing removal erases the receipt
-store durably, clears in-memory receipts, and scrubs the token."
-  (let* ((file (make-temp-file "ebp-test-receipts"))
+  "SPEC 9.1 / amendment #72: local pairing removal erases THIS pairing's
+partition of the durable receipt store, clears the session mirrors, and
+scrubs the token.  The store file itself survives — it is shared and
+partitioned, not this pairing's private file."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((directory (make-temp-file "ebp-test-forget-" t))
+         (file (expand-file-name "receipts.sqlite" directory))
+         (partition (make-string 32 ?1))
+         (event-id (make-string 32 ?c))
          (client (ebp-client-create
                   :receipt-file file
                   :token "AAECAwQFBgcICQoLDA0ODw"
-                  :pairing-id (make-string 32 ?1))))
-    (should (ebp-client--receipt-commit client (make-string 32 ?c)))
-    (should (= (hash-table-count (ebp-client-receipts client)) 1))
-    (ebp-client-forget-pairing client)
-    (should (eq (ebp-client-state client) 'closed))
-    (should-not (file-exists-p file))
-    (should (= (hash-table-count (ebp-client-receipts client)) 0))
-    (should-not (plist-get (ebp-client-config client) :token))))
+                  :pairing-id partition)))
+    (unwind-protect
+        (progn
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) 'accepted))
+          (should (equal '(:status "accepted")
+                         (ebp-client--handle-event-action
+                          client (ebp-test--event-params event-id))))
+          (should (ebp-client-event-known-p client event-id))
+          (should (ebp-client-forget-pairing client))
+          (should (eq (ebp-client-state client) 'closed))
+          (should-not (ebp-client-store client))
+          (should-not (plist-get (ebp-client-config client) :token))
+          ;; The file remains; the partition inside it is empty.
+          (should (file-exists-p file))
+          (let ((store (ebp-sqlite-open file)))
+            (unwind-protect
+                (should-not (ebp-store-known-p store partition event-id))
+              (ebp-store-close store))))
+      (delete-directory directory t))))
 
 (ert-deftest ebp-test-edit-open-reconcile-seam ()
   "SPEC 19.3 / amendment #71: the :edit-open-function hook sees the seed

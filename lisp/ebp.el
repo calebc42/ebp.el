@@ -13,6 +13,10 @@
 ;; machine and reconnect lifecycle (SPEC 5.2, 10.1).  Transport wiring is
 ;; generic EBP endpoint behavior; no Jetpacs application policy lives here.
 ;;
+;; Durable SPEC 14.4 EventId receipts are delegated to `ebp-store.el' and
+;; its `ebp-sqlite.el' backend; what this file owns is only the SPEC 14.4
+;; dispatch ordering around them.
+;;
 ;; Every function cites the section it implements.  Behavior with no
 ;; section is a bug in this file or an amendment owed to the EBP spec.
 
@@ -20,6 +24,8 @@
 
 (require 'cl-lib)
 (require 'jsonrpc)
+(require 'ebp-store)
+(require 'ebp-sqlite)
 
 ;;;; User options (custom.el: declared defaults, overridable from init.el
 ;;;; with `setopt' without touching code; per-connection config plists
@@ -32,9 +38,12 @@
 
 (defcustom ebp-receipt-file (locate-user-emacs-file "ebp-receipts")
   "Default durable store for accepted EventId receipts (SPEC 14.4).
-When built-in SQLite is available this names a SQLite database;
-otherwise an append-only text file.  A connection's :receipt-file
-config overrides it."
+The file is a SQLite database opened through `ebp-sqlite-open' and
+partitioned by pairing identity, so one file serves several pairings and
+SPEC 14.4's EventId uniqueness stays scoped to each.  Without built-in
+SQLite, or when the file cannot be opened or migrated, no store exists
+and every `event.action' answers 1500 event-retry before any handler
+runs.  A connection's :receipt-file config overrides it."
   :type 'file)
 
 (defcustom ebp-replay-retry-delay 5
@@ -606,8 +615,7 @@ Events: `hello-sent', `nonce-received', `auth-sent', `welcome-verified',
   (revisions (make-hash-table :test #'equal))
   ;; SPEC 14: the action allowlist and the durable EventId receipts.
   (actions (make-hash-table :test #'equal))
-  (receipts (make-hash-table :test #'equal))
-  receipt-db     ; sqlite handle when the backend is built-in SQLite
+  store          ; nil or an `ebp-sqlite-store' (see `ebp-receipt-file')
   ;; SPEC 14.6: latest input values by (surface . id), and this side's
   ;; reset history for the P1 #2 reconciliation rule.
   (input-values (make-hash-table :test #'equal))
@@ -690,8 +698,9 @@ settles with the backlog drained), :edit-open-function (the SPEC 19.3
 amendment-#71 seed-reconciliation seam), :receipt-file, and
 :replay-retry-delay, :auto-reconnect, :reconnect-initial-delay, and
 :reconnect-max-delay.  Without :receipt-file the SPEC 14.4 EventId
-receipts default to `ebp-receipts' under `user-emacs-directory' —
-`accepted' always names a durable commitment."
+receipts default to `ebp-receipts' under `user-emacs-directory'; see
+`ebp-receipt-file' for what that store is and what an endpoint without
+one answers.  Receipts are partitioned by :pairing-id (SPEC 14.4)."
   (unless (plist-member config :receipt-file)
     (setq config (plist-put (copy-sequence config) :receipt-file
                             ebp-receipt-file)))
@@ -732,7 +741,7 @@ receipts default to `ebp-receipts' under `user-emacs-directory' —
                                  #'ebp-client--handle-candidate-doc)
     (ebp-client-register-handler client "session.superseded"
                                  #'ebp-client--handle-session-superseded)
-    (ebp-client--receipts-load client)
+    (ebp-client--store-open client)
     client))
 
 (defun ebp-client-register-handler (client method fn)
@@ -882,17 +891,19 @@ cancels automatic redial and releases durable storage."
       (cancel-timer timer)
       (setf (ebp-client-reconnect-timer client) nil))
     (ebp-client--cancel-session-work client)
-    (when-let* ((db (ebp-client-receipt-db client)))
-      (ignore-errors (sqlite-close db))
-      (setf (ebp-client-receipt-db client) nil))
+    (when-let* ((store (ebp-client-store client)))
+      (ignore-errors (ebp-store-close store))
+      (setf (ebp-client-store client) nil))
     (when-let* ((conn (ebp-client-connection client)))
       (ignore-errors (jsonrpc-shutdown conn)))))
 
 (defun ebp-client-forget-pairing (client)
   "SPEC 9.1 (amendment #72): local removal of this pairing.
-Closes the connection, durably erases the EventId receipt store (the
-SQLite or text file and its sidecars), clears the in-memory receipts,
-and scrubs the token from this client's config.  Erasure covers
+Erases this pairing's partition of the SQLite receipt store, clears the
+session-scoped in-memory mirrors, closes the connection, and scrubs the
+token from this client's config.  Other pairings' receipts in the same
+file are untouched and the file itself remains — the store is a shared,
+partitioned database, not this pairing's private file.  Erasure covers
 everything this library persists; a copy of the token the application
 stored elsewhere (auth-source, custom code) is the application's to
 erase.  Removal at this endpoint prevents future authentication but
@@ -904,25 +915,39 @@ reporting a success that did not happen.
 
 The token is destroyed with `clear-string', which zeroes it in place:
 the config holds the CALLER's string, so dropping this client's
-reference alone would leave the secret live in the caller's structure.
-
-The receipt store is process-wide, not partitioned by pairing.  Under
-`android-loopback-tcp' that is exact — the profile permits exactly one
-paired authority (SPEC 5.2) — but a multi-authority profile MUST
-partition it before reusing this."
-  (ebp-client-close client 'forget-pairing)
-  (let ((ok t))
-    (when-let* ((file (plist-get (ebp-client-config client) :receipt-file)))
-      (dolist (f (list file (concat file "-wal") (concat file "-shm")))
-        (when (file-exists-p f)
-          (condition-case err
-              (delete-file f)
-            (error (setq ok nil)
-                   (message "ebp: could not erase receipt store %s: %s"
-                            f (car err)))))))
+reference alone would leave the secret live in the caller's structure."
+  (let* ((ok nil)
+         (partition (ebp-client--partition client))
+         (file (plist-get (ebp-client-config client) :receipt-file)))
+    ;; The live handle first: it is already open on the right file.
+    (when-let* ((store (ebp-client-store client)))
+      (condition-case err
+          (progn (ebp-store-forget-pairing store partition)
+                 (setq ok t))
+        (ebp-store-error
+         (message "ebp: could not erase receipt partition in %s (%s)"
+                  file (error-message-string err)))))
+    ;; No live store: open the file once for the erasure alone.  A legacy
+    ;; flat file migrates into this partition first, so its receipts are
+    ;; erased rather than left behind under a name nothing owns.
+    (when (and (not ok) (stringp file) (file-exists-p file))
+      (condition-case err
+          (let ((store (ebp-sqlite-open file partition)))
+            (unwind-protect
+                (progn (ebp-store-forget-pairing store partition)
+                       (setq ok t))
+              (ignore-errors (ebp-store-close store))))
+        (error
+         (setq ok nil)
+         (message "ebp: could not erase receipt store %s (%s)"
+                  file (error-message-string err)))))
+    ;; Nothing was ever persisted: there is nothing left to forget.
+    (when (and (not ok) (or (not (stringp file)) (not (file-exists-p file))))
+      (setq ok t))
+    ;; Closing releases the handle the erasure above needed open.
+    (ebp-client-close client 'forget-pairing)
     ;; Every in-memory store scoped to the identity (SPEC 9.1 names
     ;; queued payloads, input drafts, cached surfaces, tombstones ...).
-    (clrhash (ebp-client-receipts client))
     (clrhash (ebp-client-input-values client))
     (clrhash (ebp-client-reset-history client))
     (clrhash (ebp-client-revisions client))
@@ -1712,78 +1737,100 @@ logged and ignored (SPEC 7.3)."
 (defconst ebp--event-id-re "\\`[0-9a-f]\\{32\\}\\'"
   "SPEC 4.4: an EventId is exactly 32 lowercase hexadecimal characters.")
 
+(defconst ebp--pairing-id-re "\\`[0-9a-f]\\{32\\}\\'"
+  "SPEC 9.1: a PairingId is exactly 32 lowercase hexadecimal characters.")
+(defconst ebp--unpaired-partition (make-string 32 ?0)
+  "The synthetic SPEC 14.4 receipt partition shared by unpaired clients.
+A client with no well-formed pairing identity has no partition of its own,
+so its receipts live here rather than in some other pairing's.")
+
 (defconst ebp-receipt-retention-seconds 604800
   "SPEC 14.4: accepted EventIds are durably retained at least this long.")
 
 (defun ebp-client-register-action (client action fn)
   "Register FN as the allowlisted handler for ACTION (SPEC 14.1).
-FN is called with (CLIENT PARAMS) after envelope validation and the
-duplicate check, inside the dispatch extent.  It MUST return one of the
-symbols `accepted', `stale', or `rejected' (SPEC 14.4/14.5); for
-`accepted', this library durably commits the EventId receipt before the
-result leaves — never author a handler whose effect must not run twice
-without also making it idempotent, as 14.4 recommends."
+FN is called with (CLIENT PARAMS) after envelope validation, the
+durable-store check, and the duplicate check, inside the dispatch extent;
+with no durable store it is not called at all and the event answers 1500
+event-retry.  It MUST return one of the symbols `accepted', `stale', or
+`rejected' (SPEC 14.4/14.5); for `accepted', this library durably commits
+the EventId receipt before the result leaves — never author a handler
+whose effect must not run twice without also making it idempotent, as
+14.4 recommends."
   (puthash action fn (ebp-client-actions client)))
 
-(defun ebp-client--receipts-load (client)
-  "Open the durable receipt store and load surviving EventIds.
-Backend: built-in SQLite when available (transactional commits, indexed
-duplicate lookup, in-place pruning); otherwise the append-only text
-file with load-time pruning."
-  (when-let* ((file (plist-get (ebp-client-config client) :receipt-file)))
-    (let ((cutoff (- (float-time) ebp-receipt-retention-seconds)))
-      (cond
-       ((and (fboundp 'sqlite-available-p) (sqlite-available-p))
-        (condition-case nil
-            (let ((db (sqlite-open file)))
-              (sqlite-execute db "CREATE TABLE IF NOT EXISTS receipts \
-(event_id TEXT PRIMARY KEY, ts REAL)")
-              ;; SPEC 14.4: the 604800 s retention is a floor; prune past it.
-              (sqlite-execute db "DELETE FROM receipts WHERE ts < ?"
-                              (list cutoff))
-              (dolist (row (sqlite-select db "SELECT event_id, ts \
-FROM receipts"))
-                (puthash (car row) (cadr row)
-                         (ebp-client-receipts client)))
-              (setf (ebp-client-receipt-db client) db))
-          ;; An unopenable path degrades to commit-time failure -> 1500.
-          (error nil)))
-       ((file-readable-p file)
-        (dolist (line (split-string
-                       (with-temp-buffer
-                         (insert-file-contents file)
-                         (buffer-string))
-                       "\n" t))
-          (pcase-let ((`(,id ,ts) (split-string line " ")))
-            (when (and id ts (> (string-to-number ts) cutoff))
-              (puthash id (string-to-number ts)
-                       (ebp-client-receipts client))))))))))
+(defun ebp--now-ms ()
+  "The local wall clock in milliseconds, SPEC 14.4's receipt timestamp."
+  (floor (* 1000 (float-time))))
 
-(defun ebp-client--receipt-commit (client event-id)
-  "Durably record EVENT-ID (SPEC 14.4); nil when the commitment failed."
-  (condition-case nil
-      (let ((now (float-time))
-            (db (ebp-client-receipt-db client)))
-        (cond
-         (db
-          ;; SQLite's default synchronous=FULL is the durable commit.
-          (sqlite-execute db
-                          "INSERT OR REPLACE INTO receipts VALUES (?, ?)"
-                          (list event-id now)))
-         ((and (fboundp 'sqlite-available-p) (sqlite-available-p))
-          ;; SQLite exists but the store never opened: no durable path.
-          (error "receipt store unavailable"))
-         (t
-          (when-let* ((file (plist-get (ebp-client-config client)
-                                       :receipt-file)))
-            ;; Emacs 30 defaults write-region-inhibit-fsync to t; a
-            ;; receipt not on stable storage is not a 14.4 commitment.
-            (let ((write-region-inhibit-fsync nil))
-              (write-region (format "%s %s\n" event-id now)
-                            nil file t 'silent)))))
-        (puthash event-id now (ebp-client-receipts client))
-        t)
-    (error nil)))
+(defun ebp-client--partition (client)
+  "Return CLIENT's durable receipt partition (SPEC 14.4).
+14.4 scopes EventId uniqueness to the pairing identity, so a well-formed
+:pairing-id IS the partition and one store file serves several pairings
+without ever confusing their receipts.  A client with no pairing yet — a
+test fixture, or an endpoint before its first `pairing.begin' — has no
+partition of its own and shares `ebp--unpaired-partition'."
+  (let ((pairing-id (plist-get (ebp-client-config client) :pairing-id)))
+    (if (and (stringp pairing-id)
+             (string-match-p ebp--pairing-id-re pairing-id))
+        pairing-id
+      ebp--unpaired-partition)))
+
+(defun ebp-client--store-open (client)
+  "Open CLIENT's configured durable receipt store (SPEC 14.4).
+Never signals: a store that cannot be opened or migrated leaves the slot
+nil, which `ebp-client--handle-event-action' answers with 1500
+event-retry before any handler runs.  The diagnostic names the path so an
+operator can act on it — a pre-SQLite text receipt file, for instance, is
+not migrated and must be removed by hand."
+  (when-let* ((file (plist-get (ebp-client-config client) :receipt-file)))
+    (let ((store
+           (condition-case err
+               (ebp-sqlite-open file (ebp-client--partition client))
+             (error
+              (message "ebp: durable receipt store %s unavailable (%s); \
+event.action answers 1500 event-retry"
+                       file (error-message-string err))
+              nil))))
+      (when store
+        (setf (ebp-client-store client) store)
+        ;; SPEC 14.4: the 604800 s retention is a floor; prune past it.
+        ;; A store that cannot prune is still a store.
+        (condition-case err
+            (ebp-store-prune store (ebp--now-ms)
+                             (* 1000 ebp-receipt-retention-seconds))
+          (error
+           (message "ebp: could not prune receipt store %s (%s)"
+                    file (error-message-string err))))))))
+
+(defun ebp-client--store-call (client thunk)
+  "Call THUNK, answering 1500 event-retry when CLIENT's store fails.
+SPEC 14.4: no commitment, no `accepted' — retryable instead; SPEC 15.3:
+schedule the replay that unpauses the Companion's pump.  This wraps
+STORE calls only.  An application handler is never called inside it, so a
+handler's own `ebp-store-error' — jetpacs-automations keeps a separate
+work store — stays the handler's to answer."
+  (condition-case _err
+      (funcall thunk)
+    (ebp-store-error
+     (ebp-client--force-replay-retry client)
+     (ebp-client--error client 1500 "Receipt commit failed"
+                        "event-retry"))))
+
+(defun ebp-client-event-known-p (client event-id)
+  "Non-nil when CLIENT durably accepted EVENT-ID already (SPEC 14.4).
+The lookup is scoped to `ebp-client--partition'.  This predicate never
+signals, so nil is NOT proof of absence: with no open store, a malformed
+id, or a storage failure it answers nil while the `event.action' server
+answers 1500 event-retry for exactly those cases."
+  (let ((store (ebp-client-store client)))
+    (and store
+         (stringp event-id)
+         (string-match-p ebp--event-id-re event-id)
+         (condition-case nil
+             (ebp-store-known-p store (ebp-client--partition client)
+                                event-id)
+           (ebp-store-error nil)))))
 
 (defun ebp-client--event-context-valid-p (params)
   "SPEC 14.4: surface, dialog, and global events carry exclusive context."
@@ -1798,10 +1845,13 @@ FROM receipts"))
 
 (defun ebp-client--handle-event-action (client params)
   "The `event.action' server (SPEC 14.4).
-Validation order per 14.4: envelope, allowlist, duplicate ID — before
-any application behavior.  The reply is the dispatcher's return value;
-the durable receipt commit happens synchronously before `accepted'
-leaves, which is exactly the ordering 14.4 requires."
+Validation order: envelope, durable-store availability, duplicate ID,
+allowlist — before any application behavior.  The reply is the
+dispatcher's return value, and `accepted' leaves only after
+`ebp-store-admit-completed' has returned `admitted', which is exactly the
+ordering 14.4 requires.  With no durable store there is nothing that can
+turn a handler's effect into a commitment, so every event answers 1500
+event-retry and no handler runs at all."
   (let ((event-id (plist-get params :event_id))
         (action (plist-get params :action)))
     (unless (and (stringp event-id)
@@ -1810,28 +1860,41 @@ leaves, which is exactly the ordering 14.4 requires."
                  (integerp (plist-get params :occurred_at_ms))
                  (ebp-client--event-context-valid-p params))
       (ebp-client--error client -32602 "Invalid params" "invalid-params"))
-    (cond
-     ;; SPEC 14.4: a repeated ID MUST NOT deliberately repeat the effect.
-     ((gethash event-id (ebp-client-receipts client))
-      '(:status "duplicate"))
-     ((null (gethash action (ebp-client-actions client)))
-      '(:status "rejected" :message "action not allowlisted"))
-     (t
-      (pcase (funcall (gethash action (ebp-client-actions client))
-                      client params)
-        ('accepted
-         (if (ebp-client--receipt-commit client event-id)
-             '(:status "accepted")
-           ;; SPEC 14.4: no commitment, no accepted — retryable instead,
-           ;; and SPEC 15.3: schedule the replay that unpauses the pump.
-           (ebp-client--force-replay-retry client)
-           (ebp-client--error client 1500 "Receipt commit failed"
-                              "event-retry")))
-        ('stale '(:status "stale"))
-        ('rejected '(:status "rejected"))
-        (other (ebp-client--error client -32603
-                                  (format "handler returned %S" other)
-                                  "internal-error")))))))
+    (let ((store (ebp-client-store client))
+          (partition (ebp-client--partition client)))
+      (unless store
+        ;; SPEC 15.3: schedule the replay that unpauses the pump.
+        (ebp-client--force-replay-retry client)
+        (ebp-client--error client 1500 "Receipt commit failed"
+                           "event-retry"))
+      (cond
+       ;; SPEC 14.4: a repeated ID MUST NOT deliberately repeat the effect.
+       ((ebp-client--store-call
+         client
+         (lambda () (ebp-store-known-p store partition event-id)))
+        '(:status "duplicate"))
+       ((null (gethash action (ebp-client-actions client)))
+        '(:status "rejected" :message "action not allowlisted"))
+       (t
+        (pcase (funcall (gethash action (ebp-client-actions client))
+                        client params)
+          ('accepted
+           (pcase (ebp-client--store-call
+                   client
+                   (lambda ()
+                     (ebp-store-admit-completed
+                      store partition event-id (ebp--now-ms))))
+             ('admitted '(:status "accepted"))
+             ;; A re-entrant second delivery admitted it already.
+             ('duplicate '(:status "duplicate"))
+             (other (ebp-client--error client -32603
+                                       (format "store returned %S" other)
+                                       "internal-error"))))
+          ('stale '(:status "stale"))
+          ('rejected '(:status "rejected"))
+          (other (ebp-client--error client -32603
+                                    (format "handler returned %S" other)
+                                    "internal-error"))))))))
 
 ;;;; Input state (SPEC 14.6 + P1 #2), the Emacs endpoint half
 
