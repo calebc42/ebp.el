@@ -10,7 +10,7 @@
 ;; (SPEC 6), envelope conventions (SPEC 7),
 ;; the JSON data-model receiver rules this layer owns (SPEC 4.1),
 ;; pairing/proof construction (SPEC 9), and a pure client session state
-;; machine and reconnect lifecycle (SPEC 5.2, 10.1).  Transport wiring is
+;; machine and reconnect lifecycle (SPEC 5.6, 10.1).  Transport wiring is
 ;; generic EBP endpoint behavior; no Jetpacs application policy lives here.
 ;;
 ;; Durable SPEC 14.4 EventId receipts are delegated to `ebp-store.el' and
@@ -24,8 +24,14 @@
 
 (require 'cl-lib)
 (require 'jsonrpc)
+(require 'gnutls)
 (require 'ebp-store)
 (require 'ebp-sqlite)
+
+;; C primitives present only in a GnuTLS-enabled build; declared so a
+;; build without one still byte-compiles this file clean.
+(declare-function gnutls-peer-status "gnutls.c" (proc))
+(declare-function gnutls-available-p "gnutls.c" ())
 
 ;;;; User options (custom.el: declared defaults, overridable from init.el
 ;;;; with `setopt' without touching code; per-connection config plists
@@ -36,15 +42,31 @@
   :group 'comm
   :prefix "ebp-")
 
-(defcustom ebp-receipt-file (locate-user-emacs-file "ebp-receipts")
-  "Default durable store for accepted EventId receipts (SPEC 14.4).
-The file is a SQLite database opened through `ebp-sqlite-open' and
-partitioned by pairing identity, so one file serves several pairings and
-SPEC 14.4's EventId uniqueness stays scoped to each.  Without built-in
-SQLite, or when the file cannot be opened or migrated, no store exists
-and every `event.action' answers 1500 event-retry before any handler
-runs.  A connection's :receipt-file config overrides it."
+(defcustom ebp-directory (locate-user-emacs-file "ebp/")
+  "Directory holding everything this library persists.
+Relative file options such as `ebp-receipt-file' resolve against it
+through `ebp--data-file' at client creation, never at load time, so a
+`setopt' in init.el relocates every file at once.  The client creates
+the directory on first use when it is missing."
+  :type 'directory)
+
+(defcustom ebp-receipt-file "ebp-receipts"
+  "Durable store for accepted EventId receipts (SPEC 14.4).
+A relative name is resolved against `ebp-directory'; an absolute path
+is used as given.  The file is a SQLite database opened through
+`ebp-sqlite-open' and partitioned by pairing identity, so one file
+serves several pairings and SPEC 14.4's EventId uniqueness stays scoped
+to each.  Without built-in SQLite, or when the file cannot be opened or
+migrated, no store exists and every `event.action' answers 1500
+event-retry before any handler runs.  A connection's :receipt-file
+config overrides it and resolves the same way."
   :type 'file)
+
+(defun ebp--data-file (name)
+  "Absolute path for persisted file NAME under `ebp-directory'.
+An absolute NAME is returned expanded as given, so a full path in an
+option or a connection config always wins over the directory."
+  (expand-file-name name ebp-directory))
 
 (defcustom ebp-replay-retry-delay 5
   "Initial seconds before retrying `queue.replay' (SPEC 15.3).
@@ -58,22 +80,27 @@ A connection's :replay-retry-delay config overrides it."
 
 (defcustom ebp-auto-reconnect t
   "Whether an unexpected transport loss schedules a fresh EBP handshake.
-The Android loopback profile makes Emacs the dialer (SPEC 5.2), so the
-default keeps one logical endpoint alive while the Companion process is
-stopped and restarted.  Redials use jittered bounded backoff.  An explicit
-`session.superseded' notification and `ebp-client-close' both stop automatic
-redial.  A connection's :auto-reconnect config overrides this option."
+Under every transport profile this endpoint implements (SPEC 5.2-5.4)
+Emacs is the dialer, so Emacs alone can re-establish a transport the
+Companion's platform tore down — an Android process kill, a desktop
+Companion restart, a phone that left the network.  The default keeps one
+logical endpoint alive across those.  Redials use the jittered bounded
+backoff SPEC 5.6 requires of the dialing endpoint.  An explicit
+`session.superseded' notification, a refused transport (a `network-tls'
+certificate mismatch, a Unix socket owned by another user), and
+`ebp-client-close' all stop automatic redial.  A connection's
+:auto-reconnect config overrides this option."
   :type 'boolean)
 
 (defcustom ebp-reconnect-initial-delay 1
-  "Initial seconds before an automatic transport redial (SPEC 5.2).
+  "Initial seconds before an automatic transport redial (SPEC 5.6).
 Each failed attempt doubles the base delay up to
 `ebp-reconnect-max-delay'; every scheduled delay is jittered.  A
 connection's :reconnect-initial-delay config overrides this option."
   :type 'number)
 
 (defcustom ebp-reconnect-max-delay 15
-  "Ceiling in seconds for automatic transport redial backoff (SPEC 5.2).
+  "Ceiling in seconds for automatic transport redial backoff (SPEC 5.6).
 The actual delay is jittered below this ceiling.  A connection's
 :reconnect-max-delay config overrides this option."
   :type 'number)
@@ -176,8 +203,11 @@ it is refused during decoding on the same terms as the 4.5 depth limit.
 Emacs reads oversized integers as bignums and overflowing literals as
 infinities, so both survive `json-parse-string' silently otherwise.  A
 literal that underflowed to zero decodes AS zero and is accepted.
-VALUE is walked structurally: alist conses and array lists alike."
+VALUE is walked structurally: alist conses, array lists, plists, and
+vectors alike, so both decoded shapes (the reference alist codec and the
+jsonrpc plist codec of `ebp--parse-message') are covered."
   (cond
+   ((vectorp value) (mapc #'ebp--check-numbers value))
    ((integerp value)
     (when (or (> value ebp-max-safe-integer)
               (< value (- ebp-max-safe-integer)))
@@ -186,8 +216,15 @@ VALUE is walked structurally: alist conses and array lists alike."
     (when (or (isnan value) (= value 1.0e+INF) (= value -1.0e+INF))
       (signal 'ebp-parse-error (list "number out of range"))))
    ((consp value)
-    (ebp--check-numbers (car value))
-    (ebp--check-numbers (cdr value)))))
+    ;; Walk the spine iteratively: an object or array must cost nesting
+    ;; depth, never recursion depth per member — a 400-member object
+    ;; recursing down its cdr chain exceeds `max-lisp-eval-depth'.  A
+    ;; dotted alist pair ends in a non-list cdr, checked last.
+    (let ((cell value))
+      (while (consp cell)
+        (ebp--check-numbers (car cell))
+        (setq cell (cdr cell)))
+      (ebp--check-numbers cell)))))
 
 (defun ebp--json-serialize (value)
   "Serialize VALUE (alists/plists per `json-serialize') to a JSON string."
@@ -319,6 +356,38 @@ no duplicate member names."
       (ebp--check-numbers value)
       value)))
 
+(defun ebp--parse-message (bytes)
+  "Decode one complete message body BYTES into a jsonrpc-style keyword plist.
+The SPEC 4.1/6.2 receiver rules `ebp--parse-body' applies for the
+reference alist codec, applied to the live shape `jsonrpc-connection-receive'
+dispatches: strict UTF-8, the 4.5 depth cap before parsing, a single
+top-level object, no duplicate member names, no numbers the data model
+cannot carry.  Arrays decode as vectors, `null' as nil, and `false' as
+`:json-false', exactly as jsonrpc.el's own decoder does.  Signals
+`ebp-parse-error' or `ebp-invalid-request'.  SPEC 23.5: the CALLER binds
+a throwaway `obarray' around this call and runs `ebp--remap-decoded' on
+the result outside it, as the process-filter wrapper in
+`ebp-client--open-dialer-transport' does for jsonrpc.el's parse."
+  (let ((text (ebp--decode-utf-8 bytes)))
+    (when (ebp--exceeds-depth-p text)
+      (signal 'ebp-parse-error (list "nesting depth exceeds 64")))
+    (let ((value (condition-case nil
+                     (json-parse-string text :object-type 'plist
+                                        :array-type 'array
+                                        :null-object nil
+                                        :false-object :json-false)
+                   (error (signal 'ebp-parse-error (list "invalid JSON"))))))
+      ;; {} and null both decode to nil; [] is a vector.  The first
+      ;; non-whitespace character settles what the text actually was.
+      (unless (and (listp value)
+                   (let ((lead (string-trim-left text)))
+                     (and (> (length lead) 0) (eq (aref lead 0) ?{))))
+        (signal 'ebp-invalid-request (list "top-level value is not an object")))
+      (when (ebp--duplicate-members-p text)
+        (signal 'ebp-invalid-request (list "duplicate member names")))
+      (ebp--check-numbers value)
+      value)))
+
 (defun ebp-decoder-feed (decoder bytes)
   "Feed unibyte BYTES into DECODER; return the list of complete messages.
 Implements the SPEC 6.2 receiver.  Signals `ebp-frame-close',
@@ -412,6 +481,49 @@ structurally invalid message."
      ((and method (not has-id) (not has-result) (not has-error)) 'notification)
      ((and (not method) has-id (xor has-result has-error)) 'response)
      (t nil))))
+
+(defconst ebp--envelope-members '(:jsonrpc :id :method :params :result :error)
+  "SPEC 7.1: the members a message object may carry at the top level.")
+
+(defun ebp--validate-message-plist (msg)
+  "Check keyword plist MSG against SPEC 7.1 or signal `ebp-invalid-request'.
+The signal data is (REASON ID): ID is MSG's request id when it carries a
+valid one, else nil, so a responder can answer an invalid request with
+its id where one exists and with null otherwise.  Runs AFTER
+`ebp--remap-decoded', since the checks compare against source-literal
+keywords.  An unknown top-level member is refused rather than ignored
+because `jsonrpc-connection-receive' destructures the envelope strictly
+and would otherwise fail inside the delivery timer, leaving a request
+unanswered — the unbounded stall SPEC 6.2 forbids."
+  (let* ((has-id (plist-member msg :id))
+         (id (plist-get msg :id))
+         (valid-id (and has-id (ebp-valid-request-id-p id) id))
+         (fail (lambda (reason)
+                 (signal 'ebp-invalid-request (list reason valid-id)))))
+    (unless (equal (plist-get msg :jsonrpc) "2.0")
+      (funcall fail "jsonrpc member is not \"2.0\""))
+    (cl-loop for (k _v) on msg by #'cddr
+             unless (memq k ebp--envelope-members)
+             do (funcall fail "unknown envelope member"))
+    (let ((has-method (plist-member msg :method))
+          (method (plist-get msg :method))
+          (has-result (plist-member msg :result))
+          (has-error (plist-member msg :error)))
+      (when (and has-method
+                 (not (and (stringp method) (ebp--identifier-p method))))
+        (funcall fail "method is not an identifier"))
+      (when (and has-id (not valid-id))
+        (funcall fail "id is not a valid request id"))
+      (when (plist-member msg :params)
+        (let ((params (plist-get msg :params)))
+          (unless (or (null params)
+                      (and (consp params) (symbolp (car params))))
+            (funcall fail "params is not an object"))))
+      (unless (or (and has-method has-id (not has-result) (not has-error))
+                  (and has-method (not has-id) (not has-result) (not has-error))
+                  (and (not has-method) has-id (xor has-result has-error)))
+        (funcall fail "not a request, notification, or response"))
+      msg)))
 
 ;;;; Pairing and proofs (SPEC 9)
 
@@ -540,11 +652,19 @@ Events: `hello-sent', `nonce-received', `auth-sent', `welcome-verified',
 ;; synchronously within the dispatch extent, so a handler stashes its data
 ;; on the connection and this override re-attaches it.
 
-(defclass ebp--connection (jsonrpc-process-connection)
+(defclass ebp--endpoint-mixin ()
   ((ebp-error-data :initform nil :accessor ebp--connection-error-data)
-   (ebp-client :initform nil :accessor ebp--connection-client)))
+   (ebp-client :initform nil :accessor ebp--connection-client))
+  "What every EBP connection class shares, whatever carries the bytes:
+the SPEC 8 error-data stash and the back-pointer to its `ebp-client'.
+`ebp--connection' rides jsonrpc.el's process transport; the optional
+`ebp-websocket' feature adds a `jsonrpc-connection' subclass for SPEC
+5.5.  The two methods below specialize on this mixin so both inherit
+them.")
 
-(cl-defmethod jsonrpc-convert-to-endpoint ((conn ebp--connection)
+(defclass ebp--connection (ebp--endpoint-mixin jsonrpc-process-connection) ())
+
+(cl-defmethod jsonrpc-convert-to-endpoint ((conn ebp--endpoint-mixin)
                                            _message subtype)
   (let ((converted (cl-call-next-method)))
     (when-let* ((data (ebp--connection-error-data conn)))
@@ -563,7 +683,7 @@ Events: `hello-sent', `nonce-received', `auth-sent', `welcome-verified',
 ;; single reader thread is blocked writing to us.
 (defvar ebp--in-send)                   ; defined with the overload section
 
-(cl-defmethod jsonrpc-connection-send :around ((conn ebp--connection)
+(cl-defmethod jsonrpc-connection-send :around ((conn ebp--endpoint-mixin)
                                                &rest _args
                                                &key &allow-other-keys)
   (when-let* ((client (ebp--connection-client conn)))
@@ -596,7 +716,8 @@ Events: `hello-sent', `nonce-received', `auth-sent', `welcome-verified',
   config          ; plist: :client-name :client-version :pairing-id :token
                   ;        :wants, :receipt-file, and for tests :client-nonce
   connection      ; jsonrpc-process-connection
-  ;; SPEC 5.2 transport identity and logical-endpoint lifecycle.  A client
+  ;; SPEC 5.2-5.4 transport identity (`host' is the socket path under
+  ;; loopback-unix) and the SPEC 5.6 logical-endpoint lifecycle.  A client
   ;; object survives ordinary Companion process death: only its transport and
   ;; session-scoped mirrors are replaced.  `terminal-p' distinguishes an
   ;; explicit/protocol close from the transient CLOSED state between redials.
@@ -687,7 +808,15 @@ Events: `hello-sent', `nonce-received', `auth-sent', `welcome-verified',
   (outstanding 0)  ; requests in flight (the sender-side ceiling)
   outstanding-held ; sticky refusal latch until <= `ebp-overload-resume'
   inbound-paused   ; reading stopped for transport backpressure
-  overloaded)      ; 1401 sent, close in progress — the rate-limit latch
+  overloaded       ; 1401 sent, close in progress — the rate-limit latch
+  ;; SPEC 5.6 under a binder profile (SPEC 5.5): a CANDIDATE is a shallow
+  ;; copy of the logical client that runs one handshake on one accepted
+  ;; connection; `parent' is the logical client it is adopted into at
+  ;; welcome-verified (`ebp-client--adopt'), nil on every real client.
+  parent
+  ;; Opaque, owned by the transport module (a listener and its pending
+  ;; candidates under `ebp-websocket'); nil for the dialer profiles.
+  transport-state)
 
 (defun ebp-client-create (&rest config)
   "Create a client engine in `connected'.  CONFIG is the struct's config
@@ -698,12 +827,16 @@ settles with the backlog drained), :edit-open-function (the SPEC 19.3
 amendment-#71 seed-reconciliation seam), :receipt-file, and
 :replay-retry-delay, :auto-reconnect, :reconnect-initial-delay, and
 :reconnect-max-delay.  Without :receipt-file the SPEC 14.4 EventId
-receipts default to `ebp-receipts' under `user-emacs-directory'; see
+receipts default to `ebp-receipt-file' under `ebp-directory'; see
 `ebp-receipt-file' for what that store is and what an endpoint without
-one answers.  Receipts are partitioned by :pairing-id (SPEC 14.4)."
-  (unless (plist-member config :receipt-file)
+one answers.  A relative :receipt-file resolves against `ebp-directory'
+too, never against `default-directory'; an explicit nil means no store.
+Receipts are partitioned by :pairing-id (SPEC 14.4)."
+  (let ((file (if (plist-member config :receipt-file)
+                  (plist-get config :receipt-file)
+                ebp-receipt-file)))
     (setq config (plist-put (copy-sequence config) :receipt-file
-                            ebp-receipt-file)))
+                            (and (stringp file) (ebp--data-file file)))))
   (let ((client (ebp--make-client :config config)))
     (when-let* ((fn (plist-get config :ready-function)))
       (push fn (ebp-client-ready-functions client)))
@@ -778,7 +911,7 @@ ends the logical endpoint."
 (defun ebp--reconnect-jitter (base)
   "Return a jittered delay in [0.75 * BASE, BASE].
 Randomizing even the capped attempts prevents two local authorities whose
-transports failed together from redialing in lockstep (SPEC 5.2)."
+transports failed together from redialing in lockstep (SPEC 5.6)."
   (* base (+ 0.75 (/ (random 250001) 1000000.0))))
 
 (defun ebp-client--cancel-session-work (client)
@@ -815,8 +948,13 @@ session identities do not."
         (ebp-client-overloaded client) nil))
 
 (defun ebp-client--schedule-reconnect (client)
-  "Schedule CLIENT's next automatic dial with jittered bounded backoff."
+  "Schedule CLIENT's next automatic dial with jittered bounded backoff.
+Only a dialing endpoint redials (SPEC 5.6): under a binder profile the
+listener keeps accepting and the Companion is the one that redials, so
+this is a no-op there and the logical client simply waits, `closed' but
+active, for the next accepted connection."
   (when (and (ebp-client-active-p client)
+             (eq (ebp-client--transport-role client) 'dialer)
              (ebp-client--auto-reconnect-p client)
              (null (ebp-client-reconnect-timer client)))
     (let* ((initial (ebp-client--reconnect-setting
@@ -841,6 +979,13 @@ session identities do not."
         (progn
           (ebp-client--reset-session client)
           (ebp-client--open-transport client))
+      (ebp-transport-refused
+       ;; SPEC 5.3/5.4: a refused transport is terminal.  The endpoint at
+       ;; that address is not our Companion; redialing repeats the refusal
+       ;; and, for a pin mismatch, keeps offering a handshake to a possible
+       ;; impostor.
+       (message "ebp: transport refused (%S); not redialing" (cdr err))
+       (ebp-client-close client (cons 'transport-refused (cdr err))))
       (error
        (setf (ebp-client-state client) 'closed
              (ebp-client-close-reason client) '(transport-unavailable))
@@ -873,11 +1018,97 @@ so the next session cannot race callbacks owned by the dead transport."
           (ebp-client-process client) nil)
     (ebp-client--schedule-reconnect client)))
 
+(defun ebp-client--make-candidate (client)
+  "A candidate session for CLIENT: a shallow copy that runs one handshake.
+SPEC 5.6 under a binder profile: every accepted connection attempts the
+Section 9 handshake while the logical endpoint's session stays live, so
+each attempt needs session state of its own.  The copy shares everything
+durable or application-owned BY REFERENCE — config, handlers, actions,
+revision floors, retained input values, reset history, every hook list —
+and gets fresh session-scoped tables BEFORE `ebp-client--reset-session'
+runs on it, because a reset on a raw copy would clear the live session's
+editors.  Its store is nil on purpose: adoption happens at
+welcome-verified, before any replayed `event.action' can arrive, so a
+candidate never needs to commit a receipt.  `ebp-client-close' on a
+candidate is terminal for the candidate only."
+  (let ((c (copy-ebp-client client)))
+    (setf (ebp-client-editors c) (make-hash-table :test #'equal)
+          (ebp-client-input-carets c) (make-hash-table :test #'equal)
+          (ebp-client-candidate-replies c) (make-hash-table :test #'equal)
+          (ebp-client-edit-complete-overrides c) (make-hash-table :test #'equal)
+          (ebp-client-store c) nil
+          (ebp-client-connection c) nil
+          (ebp-client-process c) nil
+          (ebp-client-transport-state c) nil
+          (ebp-client-reconnect-timer c) nil
+          (ebp-client-replay-retry-timer c) nil
+          (ebp-client-replay-in-flight c) nil
+          (ebp-client-terminal-p c) nil
+          (ebp-client-reconnect-attempt c) 0
+          (ebp-client-parent c) client)
+    (ebp-client--reset-session c)
+    c))
+
+(defun ebp-client--adopt (client)
+  "Promote CLIENT's freshly verified session into its parent (SPEC 5.5/5.6).
+Returns the client the rest of the handshake continues on: CLIENT itself
+when it is not a candidate (every dialer profile — byte-for-byte the old
+behavior), else the parent.  The order is load-bearing: the parent is
+re-pointed at the new connection FIRST, so the old transport's shutdown
+hook finds a connection that is no longer the parent's and stays inert;
+the old connection is shut down SECOND, which concludes the superseded
+session's outstanding requests locally (their continuations decrement the
+parent's `outstanding', so this precedes the reset that zeroes it); the
+parent's session-scoped state is reset THIRD and the verified session
+copied in FOURTH.  That copy is the one direct `state' write that
+bypasses the pure machine; the candidate reached `syncing' through
+`ebp-client--step' legitimately.  Finally the candidate is retired
+\(terminal, `adopted') so a stale pre-auth timer's close is a no-op."
+  (let ((parent (ebp-client-parent client)))
+    (if (null parent)
+        client
+      (let ((old (ebp-client-connection parent))
+            (new (ebp-client-connection client)))
+        (setf (ebp-client-connection parent) new
+              (ebp-client-process parent) (ebp-client-process client))
+        (when new (setf (ebp--connection-client new) parent))
+        (when old (ignore-errors (jsonrpc-shutdown old)))
+        (ebp-client--reset-session parent)
+        (setf (ebp-client-state parent) (ebp-client-state client)
+              (ebp-client-client-nonce parent) (ebp-client-client-nonce client)
+              (ebp-client-granted parent) (ebp-client-granted client)
+              (ebp-client-profiles parent) (ebp-client-profiles client)
+              (ebp-client-surfaces parent) (ebp-client-surfaces client)
+              (ebp-client-limits parent) (ebp-client-limits client)
+              (ebp-client-input-state parent) (ebp-client-input-state client)
+              (ebp-client-device parent) (ebp-client-device client)
+              (ebp-client-window parent) (ebp-client-window client)
+              (ebp-client-outstanding parent) (ebp-client-outstanding client)
+              (ebp-client-outstanding-held parent) (ebp-client-outstanding-held client)
+              (ebp-client-inbound-paused parent) (ebp-client-inbound-paused client)
+              (ebp-client-overloaded parent) (ebp-client-overloaded client))
+        (setf (ebp-client-connection client) nil
+              (ebp-client-process client) nil
+              (ebp-client-parent client) nil
+              (ebp-client-terminal-p client) t
+              (ebp-client-state client) 'closed
+              (ebp-client-close-reason client) '(adopted))
+        (when-let* ((fn (plist-get (ebp--transport (ebp-client--transport parent))
+                                   :adopt)))
+          (funcall fn parent client))
+        parent))))
+
 (defun ebp-client--handle-session-superseded (client _params)
-  "Stand CLIENT down after `session.superseded' (SPEC 5.2).
+  "Stand CLIENT down after `session.superseded' (SPEC 5.6).
 Explicit supersession is terminal for automatic reconnect.  A later manual
-`ebp-connect' is user intent and may create a new logical endpoint."
-  (ebp-client-close client '(session-superseded)))
+`ebp-connect' is user intent and may create a new logical endpoint.
+Under a binder profile the notification is not used (SPEC 5.5): a
+Companion that sends it anyway is logged and ignored rather than allowed
+to stop the listener."
+  (if (eq (ebp-client--transport-role client) 'binder)
+      (message "ebp: session.superseded is not used under %s (SPEC 5.5); ignored"
+               (ebp-client--transport client))
+    (ebp-client-close client '(session-superseded))))
 
 (defun ebp-client-close (client reason)
   "Terminally close CLIENT for REASON (SPEC 10.1).
@@ -891,6 +1122,12 @@ cancels automatic redial and releases durable storage."
       (cancel-timer timer)
       (setf (ebp-client-reconnect-timer client) nil))
     (ebp-client--cancel-session-work client)
+    ;; A binder's listener and pending candidates go with the logical
+    ;; client (SPEC 5.5); a candidate closes only itself.
+    (unless (ebp-client-parent client)
+      (when-let* ((fn (plist-get (ebp--transport (ebp-client--transport client))
+                                 :close)))
+        (ignore-errors (funcall fn client))))
     (when-let* ((store (ebp-client-store client)))
       (ignore-errors (ebp-store-close store))
       (setf (ebp-client-store client) nil))
@@ -901,7 +1138,8 @@ cancels automatic redial and releases durable storage."
   "SPEC 9.1 (amendment #72): local removal of this pairing.
 Erases this pairing's partition of the SQLite receipt store, clears the
 session-scoped in-memory mirrors, closes the connection, and scrubs the
-token from this client's config.  Other pairings' receipts in the same
+token and the SPEC 5.4 certificate digest from this client's config.
+Other pairings' receipts in the same
 file are untouched and the file itself remains — the store is a shared,
 partitioned database, not this pairing's private file.  Erasure covers
 everything this library persists; a copy of the token the application
@@ -959,6 +1197,11 @@ reference alone would leave the secret live in the caller's structure."
       (when (stringp token) (ignore-errors (clear-string token))))
     (setf (ebp-client-config client)
           (plist-put (ebp-client-config client) :token nil))
+    ;; SPEC 5.4: revocation destroys the recorded certificate digest too.
+    (when (plist-member (ebp-client-config client) :certificate-fingerprint)
+      (setf (ebp-client-config client)
+            (plist-put (ebp-client-config client)
+                       :certificate-fingerprint nil)))
     ok))
 
 (defun ebp-client--step (client event)
@@ -1086,7 +1329,13 @@ that MUST follow the report makes a second report impossible."
                                :message "Inbound processing capacity exhausted"
                                :data (list :kind "overloaded"))))
     (message "ebp: overloaded (%s); closing" why)
-    (ebp-client-close client (list 'overloaded why))))
+    (if (and (eq (ebp-client--transport-role client) 'binder)
+             (null (ebp-client-parent client)))
+        ;; SPEC 22.3 closes the CONNECTION; a listener keeps listening and
+        ;; the Companion redials with backoff (SPEC 5.6).
+        (when-let* ((conn (ebp-client-connection client)))
+          (ignore-errors (jsonrpc-shutdown conn)))
+      (ebp-client-close client (list 'overloaded why)))))
 
 ;;;; Rented-library sink redaction and decode isolation (SPEC 23.3/23.5)
 
@@ -1515,42 +1764,55 @@ synchronization barrier (SPEC 10.3)."
           ;; snapshot can be authored for the right size class.
           (ebp-client-window client) (plist-get result :window))
     ;; Reported floors cover snapshots AND tombstones (SPEC 10.2/13.3).
+    ;; Each is absorbed — persisted, and only ever rising — rather than
+    ;; installed verbatim: a floor this endpoint persisted in a previous
+    ;; life above what the Companion now reports is the Companion's store
+    ;; diverging (SPEC 13.2), and Emacs continues above its own number.
+    ;; A malformed floor fails the welcome; a commit failure closes the
+    ;; client (see `ebp-client--absorb-floor'), which ends the barrier.
     (cl-loop for (key entry) on (plist-get result :surfaces) by #'cddr
-             do (puthash (substring (symbol-name key) 1)
-                         (plist-get entry :revision)
-                         (ebp-client-revisions client)))
-    ;; Step 2: merge welcome input_state into the UI-state store.
-    (cl-loop for (skey svals) on (plist-get result :input_state) by #'cddr
-             do (cl-loop for (ikey value) on svals by #'cddr
-                         do (puthash (cons (substring (symbol-name skey) 1)
-                                           (substring (symbol-name ikey) 1))
-                                     value
-                                     (ebp-client-input-values client))))
-    (ebp-client--step client 'welcome-verified)
-    ;; SPEC 10.3 step 3: the application pushes required surfaces (with
-    ;; retained drafts reflected) BEFORE replay; send order is wire order.
-    (when-let* ((fn (plist-get (ebp-client-config client)
-                               :before-replay-function)))
-      (funcall fn client))
-    ;; Step 4: replay concludes before session.ready — and SPEC 10.3: a
-    ;; replay concludes for the barrier on ANY result, ANY JSON-RPC error,
-    ;; or local abandonment.  An error must not close the connection: the
-    ;; backlog is durable, FIFO survives, and SPEC 15.3 retries it in READY.
-    ;; A replay may make one round trip per retained event up to
-    ;; max_queued_events, so the local deadline must be generous and must
-    ;; not be the only thing that ends SYNCING.
-    (ebp-client--request
-     client 'queue.replay ebp--empty-object
-     (lambda (result error)
-       (unless (ebp--transport-error-p error)
-         (if error
-             (display-warning
-              'ebp (format "queue.replay concluded with error %S; proceeding \
+             for revision = (plist-get entry :revision)
+             while (ebp-client-active-p client)
+             do (if (and (integerp revision) (>= revision 0))
+                    (ebp-client--absorb-floor
+                     client (substring (symbol-name key) 1) revision)
+                  (ebp-client-close client '(welcome-incomplete))))
+    (when (ebp-client-active-p client)
+      ;; Step 2: merge welcome input_state into the UI-state store.
+      (cl-loop for (skey svals) on (plist-get result :input_state) by #'cddr
+               do (cl-loop for (ikey value) on svals by #'cddr
+                           do (puthash (cons (substring (symbol-name skey) 1)
+                                             (substring (symbol-name ikey) 1))
+                                       value
+                                       (ebp-client-input-values client))))
+      (ebp-client--step client 'welcome-verified)
+      ;; SPEC 5.5/5.6: a candidate's verified session becomes the logical
+      ;; client's here; every dialer client is returned unchanged.
+      (setq client (ebp-client--adopt client))
+      ;; SPEC 10.3 step 3: the application pushes required surfaces (with
+      ;; retained drafts reflected) BEFORE replay; send order is wire order.
+      (when-let* ((fn (plist-get (ebp-client-config client)
+                                 :before-replay-function)))
+        (funcall fn client))
+      ;; Step 4: replay concludes before session.ready — and SPEC 10.3: a
+      ;; replay concludes for the barrier on ANY result, ANY JSON-RPC
+      ;; error, or local abandonment.  An error must not close the
+      ;; connection: the backlog is durable, FIFO survives, and SPEC 15.3
+      ;; retries it in READY.  A replay may make one round trip per
+      ;; retained event up to max_queued_events, so the local deadline must
+      ;; be generous and must not be the only thing that ends SYNCING.
+      (ebp-client--request
+       client 'queue.replay ebp--empty-object
+       (lambda (result error)
+         (unless (ebp--transport-error-p error)
+           (if error
+               (display-warning
+                'ebp (format "queue.replay concluded with error %S; proceeding \
 to session.ready and retrying in READY (SPEC 10.3)" error)
-              :warning)
-           (setf (ebp-client-replay-summary client) result))
-         (ebp-client--send-ready client (and error t))))
-     300))))
+                :warning)
+             (setf (ebp-client-replay-summary client) result))
+           (ebp-client--send-ready client (and error t))))
+       300)))))
 
 (defun ebp-client--schedule-replay-retry (client delay)
   "SPEC 10.3/15.3: after READY, retry `queue.replay' with bounded
@@ -1782,11 +2044,21 @@ Never signals: a store that cannot be opened or migrated leaves the slot
 nil, which `ebp-client--handle-event-action' answers with 1500
 event-retry before any handler runs.  The diagnostic names the path so an
 operator can act on it — a pre-SQLite text receipt file, for instance, is
-not migrated and must be removed by hand."
+not migrated and must be removed by hand.
+
+The store's parent directory is created when missing.  `ebp-sqlite-open'
+refuses a missing directory on purpose — the store module never decides
+where files go — so the client, which owns the configured path, makes
+the directory before handing the path down.  A directory that cannot be
+created is one more way the store is unavailable."
   (when-let* ((file (plist-get (ebp-client-config client) :receipt-file)))
     (let ((store
            (condition-case err
-               (ebp-sqlite-open file (ebp-client--partition client))
+               (progn
+                 (when-let* ((directory (file-name-directory
+                                         (expand-file-name file))))
+                   (make-directory directory t))
+                 (ebp-sqlite-open file (ebp-client--partition client)))
              (error
               (message "ebp: durable receipt store %s unavailable (%s); \
 event.action answers 1500 event-retry"
@@ -1801,6 +2073,23 @@ event.action answers 1500 event-retry"
                              (* 1000 ebp-receipt-retention-seconds))
           (error
            (message "ebp: could not prune receipt store %s (%s)"
+                    file (error-message-string err))))
+        ;; SPEC 13.1: restore this pairing's persisted revision floors, so
+        ;; a revision reserved by a previous life — even one that died
+        ;; before its send left — is never allocated a second time.  Best
+        ;; effort here; the send-time commit in `ebp-client--surface-request'
+        ;; is the fail-closed gate.
+        (condition-case err
+            (dolist (floor (ebp-store-surface-floors
+                            store (ebp-client--partition client)))
+              (puthash (car floor)
+                       (max (cdr floor)
+                            (gethash (car floor)
+                                     (ebp-client-revisions client) -1))
+                       (ebp-client-revisions client)))
+          (error
+           (message "ebp: could not restore surface revision floors from %s \
+(%s)"
                     file (error-message-string err))))))))
 
 (defun ebp-client--store-call (client thunk)
@@ -2357,11 +2646,63 @@ state under a fresh session at seq 0."
 (defun ebp-client--surface-floor (client surface)
   (gethash surface (ebp-client-revisions client) -1))
 
+(defun ebp-client--persist-floor (client surface revision)
+  "Durably raise CLIENT's floor for SURFACE to at least REVISION.
+Returns the durable floor, which is at least REVISION.  SPEC 13.1: Emacs
+MUST persist its next revision per surface; SPEC 13.2: a reported floor
+is persisted exactly like a welcome floor.  The floor lives in the SPEC
+14.4 receipt store, partitioned by `ebp-client--partition', so the two
+kinds of durable endpoint state share one file and one pairing scope.
+
+With no durable store the in-memory value is all there is and REVISION
+is returned unchanged: such an endpoint already answers 1500 event-retry
+to every event and is not conforming, so nothing is lost that was ever
+promised.  `ebp-store-error' propagates to the caller — a floor that
+cannot be committed is never claimed."
+  (let ((store (ebp-client-store client)))
+    (if store
+        (ebp-store-raise-floor store (ebp-client--partition client)
+                               surface revision (ebp--now-ms))
+      revision)))
+
+(defun ebp-client--reserve-revision (client surface)
+  "Reserve the next revision for SURFACE and commit it before returning.
+The reserved number is above every floor this client knows AND above the
+store's floor: another life of this endpoint (or another client on the
+same partition) may have reserved past the in-memory value, in which case
+the store answers with its higher floor and the reservation climbs above
+that too.  `ebp-store-error' propagates — nothing is reserved."
+  (let* ((revision (1+ (ebp-client--surface-floor client surface)))
+         (durable (ebp-client--persist-floor client surface revision)))
+    (while (> durable revision)
+      (setq revision (1+ durable)
+            durable (ebp-client--persist-floor client surface revision)))
+    revision))
+
 (defun ebp-client--absorb-floor (client surface revision)
-  "Absorb a reported revision floor; floors only ever rise (SPEC 13.1)."
-  (puthash surface
-           (max revision (ebp-client--surface-floor client surface))
-           (ebp-client-revisions client)))
+  "Absorb a reported revision floor; floors only ever rise (SPEC 13.1).
+The floor is committed durably BEFORE it is absorbed in memory (SPEC
+13.2: persist it and never subsequently author that surface at or below
+it), and the store's own floor wins when it is higher — a reported floor
+below Emacs's persisted one is the Companion's store diverging, which
+Emacs answers by continuing above its own, never by resending below.
+
+If the commit fails the client is closed with reason
+\(revision-persistence-failed SURFACE MESSAGE) and nothing is signaled:
+an endpoint that cannot remember a floor could author below it after a
+restart, so a closed client is the fail-closed outcome.  Returns the
+absorbed floor, or nil when the client was closed."
+  (let ((floor (max revision (ebp-client--surface-floor client surface))))
+    (condition-case err
+        (progn
+          (setq floor (max floor
+                           (ebp-client--persist-floor client surface floor)))
+          (puthash surface floor (ebp-client-revisions client))
+          floor)
+      (ebp-store-error
+       (ebp-client-close client (list 'revision-persistence-failed surface
+                                      (error-message-string err)))
+       nil))))
 
 (defun ebp-client--surface-request (client method surface params callback
                                            &optional on-claim)
@@ -2377,8 +2718,15 @@ own state.  A frame large enough to fill the socket buffer blocks in
 `send_process', which spins in `wait_reading_process_output', which runs
 timers — and jsonrpc.el dispatches from timers, so an inbound
 notification can be handled re-entrantly INSIDE this send.  See
-docs/RESEARCH-A8-2026-07-25.md."
-  (let ((revision (1+ (ebp-client--surface-floor client surface))))
+docs/RESEARCH-A8-2026-07-25.md.
+
+The revision is committed to the durable store BEFORE it is claimed in
+memory and before any frame is built (SPEC 13.1): a death between the
+reservation and the send restores a floor at or above it, so the next
+life allocates a higher number, never this one again.  A store that
+cannot commit signals `ebp-store-error' out of this function — nothing
+claimed, nothing sent."
+  (let ((revision (ebp-client--reserve-revision client surface)))
     ;; Claim the revision at send time so a second push in flight is newer.
     (puthash surface revision (ebp-client-revisions client))
     (when on-claim (funcall on-claim revision))
@@ -2654,12 +3002,199 @@ remain the authored-tree form; this is the out-of-band raise."
    ;; dialog: floor a configured ceiling at 60 s.
    (or (ebp-client--user-paced-timeout ebp-dialog-timeout) 'none)))
 
-;;;; TCP transport (SPEC 5.2): jsonrpc-process-connection, unmodified
+;;;; Transports (SPEC 5.2-5.4): jsonrpc-process-connection, unmodified
+
+;; Every profile this endpoint implements has Emacs as the dialer, which is
+;; why one reconnect lifecycle (SPEC 5.6) serves all of them and why the
+;; profile is chosen here, at the socket, and nowhere else: nothing above
+;; the process object knows or cares which one carried the bytes.
+;; `loopback-websocket' (SPEC 5.5) inverts the roles and needs a WebSocket
+;; server Emacs does not ship; it belongs to the optional `ebp-websocket'
+;; feature, never to this file.  What this file provides for it is the
+;; transport registry, the binder role in the lifecycle, and the candidate
+;; adoption seam (`ebp-client--adopt').
+
+;; SPEC 5.3/5.4: a transport this endpoint MUST refuse to use.  Unlike an
+;; unavailable listener, which is retried with backoff, a refusal is
+;; terminal for automatic redial: the endpoint at that address is not the
+;; paired Companion, and redialing would only repeat the refusal.  Signal
+;; data is (REASON . DETAILS) with REASON one of `socket-owner-mismatch',
+;; `certificate-mismatch', or `tls-version-too-low'.
+(define-error 'ebp-transport-refused "EBP transport refused")
+
+(defvar ebp--transport-registry nil
+  "Alist of SPEC 5 transport profile SYMBOL -> property plist.
+Properties: `:role' (`dialer' or `binder'), and for a module-provided
+profile `:check' (HOST PORT CONFIG), `:listen' (CLIENT, idempotent),
+`:close' (CLIENT), `:adopt' (CLIENT CANDIDATE).  The three built-in
+dialer profiles register with a role only; their sockets are opened by
+`ebp-client--open-dialer-transport' directly.")
+
+(defvar ebp-transports nil
+  "The SPEC 5 transport profile symbols currently registered, newest first.")
+
+(defun ebp-register-transport (symbol &rest props)
+  "Register transport profile SYMBOL with property plist PROPS.
+See `ebp--transport-registry' for the properties.  Re-registering
+replaces the earlier entry."
+  (setf (alist-get symbol ebp--transport-registry) props)
+  (cl-pushnew symbol ebp-transports)
+  symbol)
+
+(defun ebp--transport (symbol)
+  "The registry plist for transport profile SYMBOL, or nil."
+  (alist-get symbol ebp--transport-registry))
+
+(dolist (profile '(loopback-tcp loopback-unix network-tls))
+  (ebp-register-transport profile :role 'dialer))
+
+(defun ebp-client--transport (client)
+  "CLIENT's transport profile symbol; `loopback-tcp' when unconfigured."
+  (or (plist-get (ebp-client-config client) :transport) 'loopback-tcp))
+
+(defun ebp--normalize-fingerprint (value)
+  "VALUE as 64 lowercase hex characters, or nil when it is not a digest.
+Accepts the SPEC 5.4 display form (bare hex, any case) and GnuTLS's
+\"sha256:aa:bb:...\" rendering, which is how `gnutls-peer-status' reports
+the same digest.  Never signals."
+  (when (stringp value)
+    (let* ((bare (if (string-prefix-p "sha256:" value)
+                     (substring value (length "sha256:"))
+                   value))
+           (hex (downcase (replace-regexp-in-string ":" "" bare t t))))
+      (and (string-match-p "\\`[0-9a-f]\\{64\\}\\'" hex) hex))))
+
+(defun ebp--check-transport-config (transport host port config)
+  "Signal `error' unless TRANSPORT, HOST, PORT, and CONFIG make sense together.
+Runs BEFORE any client, store, or socket exists, so a misconfiguration is
+a synchronous caller error rather than a client stuck redialing — and so
+an unpinned `network-tls' dial, exactly the unverified connection SPEC
+5.4 forbids, can never be attempted."
+  (unless (ebp--transport transport)
+    (error "ebp: unknown :transport %S (registered: %S%s)" transport ebp-transports
+           (if (eq transport 'loopback-websocket)
+               "; SPEC 5.5 needs (require 'ebp-websocket)" "")))
+  (pcase transport
+    ('loopback-unix
+     (unless (and (stringp host) (not (string-empty-p host)))
+       (error "ebp: loopback-unix takes the socket path as HOST, got %S" host))
+     (when port
+       (error "ebp: loopback-unix takes no PORT, got %S" port)))
+    ('network-tls
+     (unless (and (fboundp 'gnutls-available-p) (gnutls-available-p))
+       (error "ebp: network-tls needs an Emacs built with GnuTLS"))
+     (unless (ebp--normalize-fingerprint
+              (plist-get config :certificate-fingerprint))
+       (error "ebp: network-tls needs :certificate-fingerprint, the 64-hex \
+SHA-256 of the Companion's SubjectPublicKeyInfo shown at pairing (SPEC 5.4)"))))
+  (when-let* ((check (plist-get (ebp--transport transport) :check)))
+    (funcall check host port config)))
+
+(defun ebp-client--transport-role (client)
+  "CLIENT's SPEC 5 transport role, `dialer' (the default) or `binder'."
+  (or (plist-get (ebp--transport (ebp-client--transport client)) :role) 'dialer))
+
+(defun ebp--connection-initargs ()
+  "The dispatcher and shutdown initargs every EBP connection class shares.
+They resolve the client through the connection's back-pointer AT CALL
+TIME rather than capturing it, so `ebp-client--adopt' can re-point a
+connection from a candidate at the logical client and every message
+parsed before adoption but delivered after it lands on the right one."
+  (list :request-dispatcher
+        (lambda (c m p)
+          (when-let* ((client (ebp--connection-client c)))
+            (ebp-client--request-dispatcher client c m p)))
+        :notification-dispatcher
+        (lambda (c m p)
+          (when-let* ((client (ebp--connection-client c)))
+            (ebp-client--notification-dispatcher client c m p)))
+        :on-shutdown
+        (lambda (c)
+          (when-let* ((client (ebp--connection-client c)))
+            (ebp-client--transport-lost client c)))))
+
+(defun ebp--open-unix-socket (path)
+  "SPEC 5.3: dial the Companion's Unix-domain socket at PATH.
+Emacs MUST refuse a socket file owned by another user: on a shared host
+that file is a squatter, not the Companion, and no retry fixes it — so
+the refusal is `ebp-transport-refused', terminal for redial.  A missing
+file is the ordinary not-started-yet case and signals `file-missing',
+which the caller retries with backoff like a refused TCP connect."
+  (let ((attrs (file-attributes path 'integer)))
+    (unless attrs
+      (signal 'file-missing (list "Companion socket does not exist" path)))
+    (unless (eql (file-attribute-user-id attrs) (user-uid))
+      (signal 'ebp-transport-refused
+              (list 'socket-owner-mismatch path
+                    (file-attribute-user-id attrs) (user-uid))))
+    (make-network-process :name "ebp" :family 'local :service path
+                          :noquery t :coding 'utf-8-unix)))
+
+(defun ebp--open-tls-socket (host port fingerprint)
+  "SPEC 5.4: dial HOST:PORT inside TLS and pin the Companion's public key.
+A blocking `make-network-process' completes the TLS handshake before it
+returns, so the peer certificate is known here, before any frame exists.
+Certificate-authority and hostname checks are deliberately off
+\(:verify-error nil): the pin IS the verification, and a self-signed
+per-pairing certificate could pass no other.  The digest GnuTLS reports
+as `:public-key-id-sha256' is the SHA-256 of the DER-encoded
+SubjectPublicKeyInfo — the bytes `openssl x509 -pubkey' hashes and the
+bytes a JVM's `PublicKey.getEncoded' yields — so both ends compute the
+same 64 hex characters from the same certificate.  On a mismatch, or a
+negotiated protocol below TLS 1.3, the socket is closed with nothing
+written and `ebp-transport-refused' is signaled — terminal for redial.
+FINGERPRINT is already normalized by `ebp--normalize-fingerprint'."
+  (let ((proc (make-network-process
+               :name "ebp" :host host :service port :noquery t
+               :coding 'utf-8-unix
+               :tls-parameters
+               (cons 'gnutls-x509pki
+                     (gnutls-boot-parameters
+                      :type 'gnutls-x509pki :hostname host
+                      :verify-error nil :complete-negotiation t)))))
+    (condition-case err
+        (let* ((status (and (process-live-p proc) (gnutls-peer-status proc)))
+               (protocol (plist-get status :protocol))
+               (peer (ebp--normalize-fingerprint
+                      (plist-get (plist-get status :certificate)
+                                 :public-key-id-sha256))))
+          (unless status
+            (error "TLS handshake did not complete"))
+          (unless (and (stringp protocol)
+                       (string-match "\\`TLS\\([0-9]+\\)\\.\\([0-9]+\\)\\'" protocol)
+                       (or (> (string-to-number (match-string 1 protocol)) 1)
+                           (>= (string-to-number (match-string 2 protocol)) 3)))
+            (signal 'ebp-transport-refused
+                    (list 'tls-version-too-low host port protocol)))
+          (unless (and peer (string= peer fingerprint))
+            (signal 'ebp-transport-refused
+                    (list 'certificate-mismatch host port peer)))
+          proc)
+      (error
+       (ignore-errors (delete-process proc))
+       (signal (car err) (cdr err))))))
 
 (defun ebp-client--open-transport (client)
-  "Open CLIENT's configured loopback transport and start a fresh handshake."
+  "Open CLIENT's configured transport (SPEC 5.2-5.5).
+A dialer profile opens its socket and starts a fresh handshake at once.
+A binder profile ensures its listener is bound and returns with CLIENT
+`closed' for `(listening)': the handshake runs per accepted connection,
+on a candidate, and `ebp-client--adopt' hands the verified session to
+CLIENT."
+  (let ((entry (ebp--transport (ebp-client--transport client))))
+    (if (eq (plist-get entry :role) 'binder)
+        (progn
+          (funcall (plist-get entry :listen) client)
+          (setf (ebp-client-state client) 'closed
+                (ebp-client-close-reason client) '(listening))
+          client)
+      (ebp-client--open-dialer-transport client))))
+
+(defun ebp-client--open-dialer-transport (client)
+  "Open CLIENT's dialer transport (SPEC 5.2-5.4) and start a fresh handshake."
   (let* ((host (ebp-client-host client))
          (port (ebp-client-port client))
+         (transport (ebp-client--transport client))
          ;; Pin the coding system: jsonrpc.el 1.0.25 never sets one, so an
          ;; ambient `coding-system-for-read' (or `undecided' auto-detection
          ;; picking a non-UTF-8 charset, or DOS eol conversion mangling the
@@ -2674,23 +3209,27 @@ remain the authored-tree form; this is the out-of-band raise."
          ;; frame is then silently dropped as invalid JSON.  Verified on
          ;; 30.1: a framed body carrying "café" dispatches under
          ;; utf-8-unix and vanishes under binary.
-         (proc (make-network-process
-                :name "ebp" :host host :service port :noquery t
-                :coding 'utf-8-unix))
-         (conn (make-instance
-                'ebp--connection
-                :name "ebp" :process proc
-                ;; SPEC 23.3: do not capture message bodies in the clear by
-                ;; default; :size 0 disables the events buffer (opt in for dev).
-                :events-buffer-config
-                (if ebp-log-events '(:size nil :format full) '(:size 0))
-                :request-dispatcher
-                (lambda (c m p) (ebp-client--request-dispatcher client c m p))
-                :notification-dispatcher
-                (lambda (c m p) (ebp-client--notification-dispatcher client c m p))
-                :on-shutdown
-                (lambda (closed-connection)
-                  (ebp-client--transport-lost client closed-connection)))))
+         (proc (pcase transport
+                 ('loopback-tcp
+                  (make-network-process
+                   :name "ebp" :host host :service port :noquery t
+                   :coding 'utf-8-unix))
+                 ('loopback-unix (ebp--open-unix-socket host))
+                 ('network-tls
+                  (ebp--open-tls-socket
+                   host port
+                   (ebp--normalize-fingerprint
+                    (plist-get (ebp-client-config client)
+                               :certificate-fingerprint))))
+                 (_ (error "ebp: unknown :transport %S" transport))))
+         (conn (apply #'make-instance
+                      'ebp--connection
+                      :name "ebp" :process proc
+                      ;; SPEC 23.3: do not capture message bodies in the clear
+                      ;; by default; :size 0 disables the events buffer.
+                      :events-buffer-config
+                      (if ebp-log-events '(:size nil :format full) '(:size 0))
+                      (ebp--connection-initargs))))
     (setf (ebp-client-connection client) conn
           (ebp-client-process client) proc
           (ebp--connection-client conn) client)
@@ -2730,22 +3269,61 @@ remain the authored-tree form; this is the out-of-band raise."
 ;;;###autoload
 (defun ebp-connect (host port &rest config)
   "Dial the Companion at HOST:PORT and return one logical EBP client.
-CONFIG is `ebp-client-create' config.  Transport, framing, and id bookkeeping
-use core jsonrpc.el.  With automatic reconnect enabled (the default), an
-unavailable initial listener or later unexpected transport loss leaves the
-returned client active and schedules fresh handshakes with jittered bounded
-backoff (SPEC 5.2).  `ebp-client-close' ends that lifecycle."
+CONFIG is `ebp-client-create' config plus the transport keys below.
+Transport, framing, and id bookkeeping use core jsonrpc.el.  With
+automatic reconnect enabled (the default), an unavailable initial
+listener or later unexpected transport loss leaves the returned client
+active and schedules fresh handshakes with jittered bounded backoff
+\(SPEC 5.6).  `ebp-client-close' ends that lifecycle.
+
+:transport selects the SPEC 5 profile, one of `ebp-transports':
+  `loopback-tcp' (the default; SPEC 5.2): HOST and PORT name the
+     Companion's loopback listener, conventionally 127.0.0.1:8765.
+  `loopback-unix' (SPEC 5.3): HOST is the Companion's socket path and
+     PORT must be nil.  A socket file owned by another user is refused.
+  `network-tls' (SPEC 5.4): HOST:PORT inside TLS 1.3 or later,
+     conventionally port 8766.  :certificate-fingerprint is REQUIRED —
+     the 64-hex SHA-256 of the Companion's SubjectPublicKeyInfo shown at
+     pairing; GnuTLS's \"sha256:aa:bb:...\" spelling is accepted too.  The
+     pin is verified before `session.hello' is sent; a mismatch closes
+     the transport with nothing written.
+
+`loopback-websocket' (SPEC 5.5) is a BINDER profile provided by the
+optional `ebp-websocket' feature: HOST must be 127.0.0.1, PORT is the
+listener port (conventionally 8767), `:allowed-origins' is REQUIRED, the
+returned client is `closed' for `(listening)' until a Companion dials
+and authenticates, and it never redials.  `ebp-websocket-listen' is the
+documented entry point.
+
+A misconfigured transport signals `error' before any client exists.  A
+refused transport (`ebp-transport-refused': owner or pin mismatch, TLS
+below 1.3) is terminal whatever :auto-reconnect says: the client is
+closed with reason (transport-refused REASON ...) and the signal is
+re-raised, so a caller learns at once that the endpoint it named is not
+its Companion.  The same refusal on a later automatic redial closes the
+client the same way, observable through `ebp-client-close-reason'."
+  (ebp--check-transport-config (or (plist-get config :transport) 'loopback-tcp)
+                               host port config)
   (let ((client (apply #'ebp-client-create config)))
     (setf (ebp-client-host client) host
           (ebp-client-port client) port)
     (condition-case err
         (ebp-client--open-transport client)
+      (ebp-transport-refused
+       (ebp-client-close client (cons 'transport-refused (cdr err)))
+       (signal (car err) (cdr err)))
       (error
        (setf (ebp-client-state client) 'closed
              (ebp-client-close-reason client) '(transport-unavailable))
-       (if (ebp-client--auto-reconnect-p client)
+       (if (and (eq (ebp-client--transport-role client) 'dialer)
+                (ebp-client--auto-reconnect-p client))
            (ebp-client--schedule-reconnect client)
-         (ebp-client-close client (list 'connect-failed (car err)))
+         ;; A dialer with redial off, or a binder whose bind failed: the
+         ;; caller learns at once, like `:auto-reconnect nil'.
+         (ebp-client-close client (list (if (eq (ebp-client--transport-role client)
+                                                'binder)
+                                            'listen-failed 'connect-failed)
+                                        (car err)))
          (signal (car err) (cdr err)))))
     client))
 

@@ -112,7 +112,7 @@ Each row is a cons (EVENT-ID . TS); a nil half is stored as SQL NULL."
 (ert-deftest ebp-sqlite-creates-and-verifies-versioned-schema ()
   (ebp-store-test--with-store (store file)
     (let ((db (ebp-sqlite-store-db store)))
-      (should (= 1 (caar (sqlite-select db "PRAGMA user_version"))))
+      (should (= 2 (caar (sqlite-select db "PRAGMA user_version"))))
       (should (= 1 (caar (sqlite-select db "PRAGMA foreign_keys"))))
       (should (= 2 (caar (sqlite-select db "PRAGMA synchronous"))))
       (should (= ebp-sqlite-busy-timeout-ms
@@ -124,7 +124,8 @@ Each row is a cons (EVENT-ID . TS); a nil half is stored as SQL NULL."
                                      db "PRAGMA journal_mode"))))))
       (should
        (equal
-        '("accepted_events" "action_work" "pairing_partitions")
+        '("accepted_events" "action_work" "pairing_partitions"
+          "surface_floors")
         (sort
          (mapcar
           #'car
@@ -496,9 +497,9 @@ Each row is a cons (EVENT-ID . TS); a nil half is stored as SQL NULL."
           (setq store (ebp-sqlite-open file))
           (should (ebp-sqlite-store-p store))
           (let ((db (ebp-sqlite-store-db store)))
-            (should (= 1 (caar (sqlite-select db "PRAGMA user_version"))))
+            (should (= 2 (caar (sqlite-select db "PRAGMA user_version"))))
             (should (equal '("accepted_events" "action_work"
-                             "pairing_partitions")
+                             "pairing_partitions" "surface_floors")
                            (ebp-sqlite--user-tables db))))
           (ebp-store-close store))
       (dolist (f (list file (concat file "-wal") (concat file "-shm")))
@@ -511,9 +512,9 @@ Each row is a cons (EVENT-ID . TS); a nil half is stored as SQL NULL."
     (let ((store (ebp-sqlite-open file ebp-store-test-pair-a)))
       (unwind-protect
           (let ((db (ebp-sqlite-store-db store)))
-            (should (= 1 (caar (sqlite-select db "PRAGMA user_version"))))
+            (should (= 2 (caar (sqlite-select db "PRAGMA user_version"))))
             (should (equal '("accepted_events" "action_work"
-                             "pairing_partitions")
+                             "pairing_partitions" "surface_floors")
                            (ebp-sqlite--user-tables db)))
             (should (ebp-store-known-p
                      store ebp-store-test-pair-a ebp-store-test-event-a))
@@ -536,7 +537,8 @@ Each row is a cons (EVENT-ID . TS); a nil half is stored as SQL NULL."
                          store ebp-store-test-pair-a
                          ebp-store-test-event-a 100))))
         (ebp-store-close store)))
-    ;; The migrated file is an ordinary v1 store: no pairing id needed.
+    ;; The migrated file is an ordinary current-version store: no pairing
+    ;; id needed.
     (let ((store (ebp-sqlite-open file)))
       (unwind-protect
           (should (ebp-store-known-p
@@ -570,7 +572,7 @@ Each row is a cons (EVENT-ID . TS); a nil half is stored as SQL NULL."
     (let ((store (ebp-sqlite-open file ebp-store-test-pair-a)))
       (unwind-protect
           (progn
-            (should (= 1 (caar (sqlite-select (ebp-sqlite-store-db store)
+            (should (= 2 (caar (sqlite-select (ebp-sqlite-store-db store)
                                               "PRAGMA user_version"))))
             (should (ebp-store-known-p
                      store ebp-store-test-pair-a ebp-store-test-event-a)))

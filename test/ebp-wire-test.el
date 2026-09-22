@@ -14,6 +14,7 @@
 
 (require 'ert)
 (require 'ebp)
+(require 'ebp-test-common)
 
 (defconst ebp-test--root
   (expand-file-name ".." (file-name-directory
@@ -341,69 +342,38 @@ notify funnel ahead of any wire write."
 ;; of the loopback speaks through the reference encoder/decoder, so both
 ;; conformance layers exercise each other.
 
-(defconst ebp-test--kat-token (ebp-decode-pairing-token "AAECAwQFBgcICQoLDA0ODw"))
-(defconst ebp-test--kat-pid "101112131415161718191a1b1c1d1e1f")
-(defconst ebp-test--kat-cn "202122232425262728292a2b2c2d2e2f")
-(defconst ebp-test--kat-sn "303132333435363738393a3b3c3d3e3f")
-
-(defconst ebp-test--welcome-limits
-  '(:max_frame_bytes 4194304 :max_queued_events 256
-    :max_queued_bytes 8388608 :max_event_bytes 262144
-    :max_surfaces 16 :max_surface_ids 1024
-    :max_field_bytes 65536 :max_input_state_bytes 262144
-    :max_capture_fields 64))
-
-(defun ebp-test--welcome-result (&optional server-proof drop surfaces)
-  "A minimal SPEC 10.2 welcome result plist.
-SERVER-PROOF overrides the correct KAT proof; DROP removes that member;
-SURFACES overrides the empty surfaces map."
-  (let ((welcome
-         `(:server_proof ,(or server-proof
-                              (ebp-server-proof ebp-test--kat-token
-                                                ebp-test--kat-pid
-                                                ebp-test--kat-cn
-                                                ebp-test--kat-sn))
-           :protocol 3
-           :server (:name "kat-companion" :version "1.0.0")
-           :granted ["theme"]
-           :surface_profiles
-           (:app (:node_types ["text" "row" "column" "box" "spacer"
-                               "divider" "button" "text_input"]
-                  :builtins ["view.switch" "companion.settings.open"]
-                  :features []
-                  :extensions []))
-           :surfaces ,(or surfaces ebp--empty-object)
-           :queued_events 0
-           :limits ,ebp-test--welcome-limits)))
-    (if drop
-        (cl-loop for (k v) on welcome by #'cddr
-                 unless (eq k drop) append (list k v))
-      welcome)))
-
-(defun ebp-test--start-companion (script &optional service)
+(defun ebp-test--start-companion (script &optional service family)
   "Loopback scripted companion; returns (:port P :received FN :stop FN).
 SCRIPT is called with (MSG SEND) per decoded inbound message.  SERVICE
-defaults to an ephemeral port; a number lets a restart bind the same port."
+defaults to an ephemeral port; a number lets a restart bind the same port.
+FAMILY `local' binds a Unix-domain socket at path SERVICE instead (SPEC
+5.3); :port is then that path and :stop unlinks the socket file, which
+Emacs leaves behind on `delete-process'."
   (let* ((received '())
          (decoders (make-hash-table :test #'eq))
+         (filter
+          (lambda (conn bytes)
+            (let ((dec (or (gethash conn decoders)
+                           (puthash conn (ebp-make-decoder) decoders))))
+              (dolist (msg (ebp-decoder-feed dec bytes))
+                (push msg received)
+                (funcall script msg
+                         (lambda (reply)
+                           (process-send-string
+                            conn
+                            (ebp-encode-frame
+                             (ebp--json-serialize reply)))))))))
          (server
-          (make-network-process
-           :name "ebp-test-companion" :server t :host "127.0.0.1"
-           :service (or service t) :reuseaddr t
-           :coding 'binary :noquery t
-           :filter
-           (lambda (conn bytes)
-             (let ((dec (or (gethash conn decoders)
-                            (puthash conn (ebp-make-decoder) decoders))))
-               (dolist (msg (ebp-decoder-feed dec bytes))
-                 (push msg received)
-                 (funcall script msg
-                          (lambda (reply)
-                            (process-send-string
-                             conn
-                             (ebp-encode-frame
-                              (ebp--json-serialize reply)))))))))))
-    (list :port (cadr (process-contact server))
+          (apply #'make-network-process
+                 :name "ebp-test-companion" :server t
+                 :coding 'binary :noquery t :filter filter
+                 (if (eq family 'local)
+                     (list :family 'local :service service)
+                   (list :host "127.0.0.1" :service (or service t)
+                         :reuseaddr t)))))
+    (list :port (if (eq family 'local)
+                    service
+                  (cadr (process-contact server)))
           :received (lambda () (reverse received))
           :stop (lambda ()
                   ;; A listening server process and each accepted connection
@@ -415,53 +385,14 @@ defaults to an ephemeral port; a number lets a restart bind the same port."
                                (delete-process connection)))
                            decoders)
                   (when (process-live-p server)
-                    (delete-process server))))))
-
-(cl-defun ebp-test--kat-script (&key welcome-fn after-ready surface-fn
-                                     replay-fn)
-  "The default conformant companion script over the KAT pairing.
-REPLAY-FN, when given, is called with the 1-based replay call number and
-returns that call's summary plist."
-  (let ((replay-calls 0))
-    (lambda (msg send)
-      (let* ((method (alist-get 'method msg))
-             (id (alist-get 'id msg))
-             (reply (lambda (result)
-                      (funcall send `(:jsonrpc "2.0" :id ,id :result ,result)))))
-        (pcase method
-          ("session.hello"
-           (funcall reply `(:server_nonce ,ebp-test--kat-sn)))
-          ("auth.response"
-           (funcall reply (funcall (or welcome-fn #'identity)
-                                   (ebp-test--welcome-result))))
-          ("queue.replay"
-           (cl-incf replay-calls)
-           (funcall reply
-                    (if replay-fn
-                        (funcall replay-fn replay-calls)
-                      '(:delivered 0 :rejected 0 :expired 0 :remaining 0
-                        :blocked_by :null))))
-        ("session.ready"
-         (funcall reply ebp--empty-object)
-         (when after-ready (funcall after-ready send)))
-        ("surface.update"
-         (funcall reply
-                  (funcall (or surface-fn
-                               (lambda (m)
-                                 `(:status "applied"
-                                   :revision ,(alist-get
-                                               'revision (alist-get 'params m))
-                                   :present t)))
-                           msg)))
-        ("surface.remove"
-         (funcall reply `(:status "applied"
-                          :revision ,(alist-get 'revision (alist-get 'params msg))
-                          :present :false))))))))
+                    (delete-process server))
+                  (when (and (eq family 'local) (file-exists-p service))
+                    (delete-file service))))))
 
 (cl-defun ebp-test--reconnect-script (&key on-hello on-ready)
   "A conformant script that derives each proof from the live client nonce.
 ON-HELLO receives that nonce and ON-READY runs after the barrier.  Unlike the
-fixed KAT script, this witnesses SPEC 5.2's fresh handshake on every redial."
+fixed KAT script, this witnesses SPEC 5.6's fresh handshake on every redial."
   (let (client-nonce)
     (lambda (msg send)
       (let* ((method (alist-get 'method msg))
@@ -498,13 +429,6 @@ fixed KAT script, this witnesses SPEC 5.2's fresh handshake on every redial."
          (append extra (list :receipt-file
                              (make-temp-file "ebp-test-receipts")))))
 
-(defun ebp-test--wait (pred &optional timeout)
-  "Pump the event loop until PRED or TIMEOUT (default 5 s); return PRED."
-  (let ((deadline (+ (float-time) (or timeout 5))))
-    (while (and (not (funcall pred)) (< (float-time) deadline))
-      (accept-process-output nil 0.05))
-    (funcall pred)))
-
 (defmacro ebp-test--with-companion (spec &rest body)
   "Bind SPEC = (SERVER-VAR CLIENT-VAR SCRIPT &rest CONNECT-ARGS); cleanup after."
   (declare (indent 1))
@@ -540,7 +464,7 @@ ready — in order, with the KAT proof on the wire."
                  4194304)))))
 
 (ert-deftest ebp-test-session-superseded-stops-automatic-redial ()
-  "SPEC 5.2: an explicit supersession stands the old endpoint down."
+  "SPEC 5.6: an explicit supersession stands the old endpoint down."
   (let ((client (ebp-client-create
                  :receipt-file (make-temp-file "ebp-superseded-receipts"))))
     (setf (ebp-client-state client) 'ready)
@@ -1018,10 +942,11 @@ stranger the store must refuse."
           (let ((client (ebp-client-create :receipt-file file
                                            :pairing-id ebp-test--kat-pid)))
             (should (ebp-sqlite-store-p (ebp-client-store client)))
-            (should (= 1 (caar (sqlite-select
-                                (ebp-sqlite-store-db
-                                 (ebp-client-store client))
-                                "PRAGMA user_version"))))
+            (should (= ebp-sqlite-schema-version
+                       (caar (sqlite-select
+                              (ebp-sqlite-store-db
+                               (ebp-client-store client))
+                              "PRAGMA user_version"))))
             (ebp-client-close client 'test-done)))
       (dolist (f (list file (concat file "-wal") (concat file "-shm")))
         (when (file-exists-p f) (delete-file f))))))
@@ -1108,8 +1033,9 @@ serves two pairings, and the SAME id is a fresh event for the second."
       (delete-directory directory t))))
 
 (ert-deftest ebp-test-legacy-receipt-file-migrates-on-create ()
-  "The shipped pre-v1 flat receipt file becomes a v1 partitioned store on
-the next `ebp-client-create', and its receipts keep suppressing repeats."
+  "The shipped pre-v1 flat receipt file becomes a current-version
+partitioned store on the next `ebp-client-create', and its receipts keep
+suppressing repeats."
   (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
   (let* ((directory (make-temp-file "ebp-test-legacy-" t))
          (file (expand-file-name "receipts.sqlite" directory))
@@ -1129,7 +1055,8 @@ the next `ebp-client-create', and its receipts keep suppressing repeats."
              client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
             (should (ebp-sqlite-store-p (ebp-client-store client)))
             (let ((db (ebp-sqlite-store-db (ebp-client-store client))))
-              (should (= 1 (caar (sqlite-select db "PRAGMA user_version"))))
+              (should (= ebp-sqlite-schema-version
+                         (caar (sqlite-select db "PRAGMA user_version"))))
               (should-not
                (sqlite-select
                 db "SELECT name FROM sqlite_master
@@ -1480,9 +1407,11 @@ forever and the id never concludes for SPEC 7.2."
                       ("session.ready" (funcall reply ebp--empty-object)))))
                 :ready-function (lambda (_c) (setq ready t)))
       (should (ebp-test--wait (lambda () ready)))
+      ;; SPEC 13.1: a Surface ID carries its namespace; the persisted
+      ;; revision floor refuses a bare name before anything is sent.
       (let ((ebp-request-timeout 0.3))
         (ebp-client-surface-update
-         client "main" '(:type "text" :text "hi")
+         client "app:main" '(:type "text" :text "hi")
          :callback (lambda (status error)
                      (setq answered (list status error)))))
       ;; The local deadline expires: the callback sees the abandonment...
@@ -2323,16 +2252,6 @@ a second 1500 must not stack a redundant one."
 ;; Both defects were invisible to the offline reference decoder: they live in
 ;; the rented library, so only a real connection exercises them.
 
-(defconst ebp-test--secret "SUPERSECRET-PASSWORD-VALUE-9d41"
-  "A distinctive volatile value planted in an undecodable frame body.")
-
-(defun ebp-test--sink-text ()
-  "The concatenated text of both SPEC 23.3 log sinks."
-  (concat (with-current-buffer (get-buffer-create "*Messages*") (buffer-string))
-          (if-let* ((w (get-buffer "*Warnings*")))
-              (with-current-buffer w (buffer-string))
-            "")))
-
 (ert-deftest ebp-test-jsonrpc-warn-redacts-frame-bodies ()
   "SPEC 23.3/24.6-12: an undecodable frame body never reaches a log sink.
 emacs-30.1 jsonrpc.el:768 warns with the whole `buffer-string', so a
@@ -2817,6 +2736,236 @@ only)."
         (should (equal (alist-get 'kind (alist-get 'data range-err))
                        "content-invalid"))
         (should-not (assq 'reason (alist-get 'data range-err)))))))
+
+(ert-deftest ebp-client-store-open-creates-missing-directory ()
+  "`ebp-receipt-file' defaults into an `ebp' subdirectory that need not
+exist yet; the client creates it so the first session has a store."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (let* ((root (make-temp-file "ebp-store-dir" t))
+         (file (expand-file-name "nested/deeper/ebp-receipts" root))
+         (client nil))
+    (unwind-protect
+        (progn
+          (should-not (file-exists-p (file-name-directory file)))
+          (setq client (ebp-client-create :receipt-file file))
+          (should (file-directory-p (file-name-directory file)))
+          (should (ebp-client-store client)))
+      (when client (ebp-client-close client 'test))
+      (delete-directory root t))))
+
+(ert-deftest ebp-client-receipt-file-resolves-under-ebp-directory ()
+  "`ebp-receipt-file' is a name under `ebp-directory', resolved at
+client creation: relocating the directory moves the default store, a
+relative :receipt-file lands there too, and an absolute one wins."
+  (let* ((root (make-temp-file "ebp-dir" t))
+         (ebp-directory (expand-file-name "data/" root))
+         (ebp-receipt-file "ebp-receipts")
+         (absolute (expand-file-name "elsewhere/receipts" root))
+         (defaulted (ebp-client-create))
+         (relative (ebp-client-create :receipt-file "other"))
+         (explicit (ebp-client-create :receipt-file absolute))
+         (none (ebp-client-create :receipt-file nil)))
+    (unwind-protect
+        (cl-flet ((configured (client)
+                    (plist-get (ebp-client-config client) :receipt-file)))
+          (should (equal (configured defaulted)
+                         (expand-file-name "data/ebp-receipts" root)))
+          (should (equal (configured relative)
+                         (expand-file-name "data/other" root)))
+          (should (equal (configured explicit) absolute))
+          (should-not (configured none))
+          (should-not (ebp-client-store none))
+          (when (and (fboundp 'sqlite-available-p) (sqlite-available-p))
+            (should (file-exists-p (configured defaulted)))
+            (should (file-exists-p (configured relative)))
+            (should (file-exists-p absolute))))
+      (dolist (client (list defaulted relative explicit none))
+        (ebp-client-close client 'test))
+      (delete-directory root t))))
+
+(ert-deftest ebp-client-store-open-survives-uncreatable-directory ()
+  "A directory that cannot be created is one more unavailable store:
+no signal, a nil slot, and 1500 event-retry downstream."
+  (let* ((blocker (make-temp-file "ebp-store-blocker"))
+         (file (expand-file-name "sub/ebp-receipts" blocker))
+         (client nil))
+    (unwind-protect
+        (progn
+          (setq client (ebp-client-create :receipt-file file))
+          (should-not (ebp-client-store client)))
+      (when client (ebp-client-close client 'test))
+      (delete-file blocker))))
+
+;;;; SPEC 5.2-5.4: transport profiles (amendment #190)
+
+(defconst ebp-test--dir
+  (file-name-directory (or load-file-name buffer-file-name default-directory))
+  "This test file's directory, where the TLS listener fixture lives.")
+
+(ert-deftest ebp-test-connect-rejects-misconfigured-transport ()
+  "A bad transport configuration is a caller error raised before any
+client, store, or socket exists — never a client left redialing."
+  (should-error (ebp-connect "127.0.0.1" 1 :transport 'carrier-pigeon)
+                :type 'error)
+  (should-error (ebp-connect "/tmp/x.sock" 8765 :transport 'loopback-unix)
+                :type 'error)
+  (should-error (ebp-connect nil nil :transport 'loopback-unix)
+                :type 'error)
+  ;; An unpinned network-tls dial is exactly the unverified connection
+  ;; SPEC 5.4 forbids, so the pin is demanded up front.
+  (should-error (ebp-connect "127.0.0.1" 8766 :transport 'network-tls)
+                :type 'error)
+  (should-error (ebp-connect "127.0.0.1" 8766 :transport 'network-tls
+                             :certificate-fingerprint "not-a-digest")
+                :type 'error))
+
+(ert-deftest ebp-test-fingerprint-normalization ()
+  "SPEC 5.4's display form and GnuTLS's spelling name the same digest."
+  (let ((hex (concat (make-string 32 ?a) (make-string 32 ?0))))
+    (should (equal (ebp--normalize-fingerprint hex) hex))
+    (should (equal (ebp--normalize-fingerprint (upcase hex)) hex))
+    (should (equal (ebp--normalize-fingerprint
+                    (concat "sha256:"
+                            (mapconcat #'identity (seq-partition hex 2) ":")))
+                   hex))
+    (should-not (ebp--normalize-fingerprint (substring hex 1)))
+    (should-not (ebp--normalize-fingerprint (concat hex "0")))
+    (should-not (ebp--normalize-fingerprint "sha1:aa"))
+    (should-not (ebp--normalize-fingerprint nil))))
+
+(ert-deftest ebp-test-transport-loopback-unix-handshakes-to-ready ()
+  "SPEC 5.3: the identical handshake over a Unix-domain socket, HOST = path."
+  (let* ((dir (make-temp-file "ebp-unix" t))
+         (path (expand-file-name "companion.sock" dir))
+         (server (ebp-test--start-companion (ebp-test--kat-script) path 'local))
+         (ready nil)
+         (client (apply #'ebp-connect path nil
+                        (ebp-test--kat-config
+                         :transport 'loopback-unix
+                         :ready-function (lambda (_c) (setq ready t))))))
+    (unwind-protect
+        (progn
+          (should (ebp-test--wait (lambda () ready)))
+          (should (eq (ebp-client-state client) 'ready))
+          (should (equal (mapcar (lambda (m) (alist-get 'method m))
+                                 (funcall (plist-get server :received)))
+                         '("session.hello" "auth.response"
+                           "queue.replay" "session.ready"))))
+      (ignore-errors (ebp-client-close client 'test-done))
+      (funcall (plist-get server :stop))
+      (delete-directory dir t))))
+
+(ert-deftest ebp-test-transport-loopback-unix-refuses-foreign-owner ()
+  "SPEC 5.3: a socket file owned by another user is a squatter, not the
+Companion — refused before any byte is written, and terminal for redial."
+  (let* ((dir (make-temp-file "ebp-unix-owner" t))
+         (path (expand-file-name "companion.sock" dir))
+         (server (ebp-test--start-companion (ebp-test--kat-script) path 'local)))
+    (unwind-protect
+        (let ((err (cl-letf (((symbol-function 'user-uid) (lambda () -1)))
+                     (should-error
+                      (apply #'ebp-connect path nil
+                             (ebp-test--kat-config
+                              :transport 'loopback-unix
+                              :reconnect-initial-delay 0.05
+                              :reconnect-max-delay 0.1))
+                      :type 'ebp-transport-refused))))
+          (should (eq (cadr err) 'socket-owner-mismatch))
+          (should (equal (nth 2 err) path))
+          ;; Terminal: nothing ever reaches the listener, not even after
+          ;; the redial backoff would have fired.
+          (dotimes (_ 10) (accept-process-output nil 0.05))
+          (should (null (funcall (plist-get server :received)))))
+      (funcall (plist-get server :stop))
+      (delete-directory dir t))))
+
+(defun ebp-test--tls-fixture ()
+  "A throwaway certificate: (DIR CERT KEY DIGEST), DIGEST the 64-hex SPKI
+SHA-256 exactly as SPEC 5.4 has the Companion display it, computed with
+openssl independently of GnuTLS so the two implementations are compared."
+  (let* ((dir (make-temp-file "ebp-tls" t))
+         (cert (expand-file-name "cert.pem" dir))
+         (key (expand-file-name "key.pem" dir)))
+    (unless (zerop (call-process "openssl" nil nil nil "req" "-x509"
+                                 "-newkey" "ec" "-pkeyopt"
+                                 "ec_paramgen_curve:prime256v1" "-nodes"
+                                 "-keyout" key "-out" cert
+                                 "-subj" "/CN=ebp-test" "-days" "2"))
+      (error "openssl req failed"))
+    (let ((digest
+           (string-trim
+            (shell-command-to-string
+             (format "openssl x509 -in %s -pubkey -noout \
+| openssl pkey -pubin -outform DER | openssl dgst -sha256 | sed 's/.* //'"
+                     (shell-quote-argument cert))))))
+      (unless (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest)
+        (error "could not compute the SPKI digest: %S" digest))
+      (list dir cert key digest))))
+
+(defun ebp-test--start-tls-server (cert key naccept)
+  "Run test/ebp-tls-server.py for NACCEPT connections; return (PROC PORT BUF)."
+  (let* ((port (ebp-test--free-port))
+         (buf (generate-new-buffer " *ebp-tls-server*"))
+         (proc (start-process "ebp-tls-server" buf "python3"
+                              (expand-file-name "ebp-tls-server.py" ebp-test--dir)
+                              (number-to-string port) cert key
+                              (number-to-string naccept))))
+    (set-process-query-on-exit-flag proc nil)
+    (unless (ebp-test--wait (lambda () (ebp-test--buffer-has buf "LISTENING")) 10)
+      (error "TLS fixture did not start: %s"
+             (with-current-buffer buf (buffer-string))))
+    (list proc port buf)))
+
+(ert-deftest ebp-test-transport-network-tls-pin-gates-the-hello ()
+  "SPEC 5.4: the pin is verified BEFORE `session.hello'.  A mismatch closes
+the transport with nothing written and is terminal; a match — given in
+GnuTLS's spelling — sends the hello inside a TLS 1.3 stream.  The digest
+the pin is checked against was computed by openssl, so this also witnesses
+that GnuTLS's `:public-key-id-sha256' is the SPKI SHA-256 the spec names."
+  (skip-unless (and (fboundp 'gnutls-available-p) (gnutls-available-p)
+                    (executable-find "openssl") (executable-find "python3")))
+  (pcase-let* ((`(,dir ,cert ,key ,digest) (ebp-test--tls-fixture))
+               (`(,server ,port ,buf) (ebp-test--start-tls-server cert key 2)))
+    (unwind-protect
+        (progn
+          ;; 1. Wrong pin: refused, silent, terminal.
+          (let ((err (should-error
+                      (apply #'ebp-connect "127.0.0.1" port
+                             (ebp-test--kat-config
+                              :transport 'network-tls
+                              :certificate-fingerprint
+                              (concat (make-string 63 ?0) "1")
+                              :reconnect-initial-delay 0.05
+                              :reconnect-max-delay 0.1))
+                      :type 'ebp-transport-refused)))
+            (should (eq (cadr err) 'certificate-mismatch))
+            ;; The observed digest rides the signal so a user can compare it
+            ;; with what the Companion displays.
+            (should (equal (nth 4 err) digest)))
+          (should (ebp-test--wait
+                   (lambda () (ebp-test--buffer-has buf "RECEIVED b''")) 10))
+          (should-not (ebp-test--buffer-has buf "Content-Length"))
+          ;; 2. Right pin, GnuTLS spelling: the hello goes out inside TLS 1.3,
+          ;; synchronously, before anything else can happen.
+          (let ((client (apply #'ebp-connect "127.0.0.1" port
+                               (ebp-test--kat-config
+                                :transport 'network-tls
+                                :certificate-fingerprint
+                                (concat "sha256:"
+                                        (mapconcat #'identity
+                                                   (seq-partition digest 2)
+                                                   ":"))))))
+            (unwind-protect
+                (progn
+                  (should (eq (ebp-client-state client) 'awaiting-nonce))
+                  (should (ebp-test--wait
+                           (lambda () (ebp-test--buffer-has buf "session.hello"))
+                           10))
+                  (should (= 2 (ebp-test--buffer-count buf "HANDSHAKE-OK TLSv1.3"))))
+              (ignore-errors (ebp-client-close client 'test-done)))))
+      (ignore-errors (delete-process server))
+      (ignore-errors (kill-buffer buf))
+      (delete-directory dir t))))
 
 (provide 'ebp-wire-test)
 ;;; ebp-wire-test.el ends here

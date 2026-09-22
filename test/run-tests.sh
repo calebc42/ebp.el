@@ -9,10 +9,19 @@ test -r "$spec_dir/contract.json" || {
 }
 export EBP_SPEC_DIR=$spec_dir
 
+# SPEC 5.5 (lisp/ebp-websocket.el) rents the third-party websocket package;
+# the gate takes it from a sibling checkout, like the spec, never silently.
+websocket_dir=${EBP_WEBSOCKET_DIR:-"$(pwd)/../emacs/emacs-websocket"}
+test -r "$websocket_dir/websocket.el" || {
+  echo "websocket.el not found at $websocket_dir (set EBP_WEBSOCKET_DIR)" >&2
+  exit 2
+}
+export EBP_WEBSOCKET_DIR=$websocket_dir
+
 guard_count=0
 for source in lisp/ebp*.el; do
   feature=$(basename "$source" .el)
-  EBP_GUARD_FEATURE=$feature emacs -Q --batch -L lisp \
+  EBP_GUARD_FEATURE=$feature emacs -Q --batch -L lisp -L "$websocket_dir" \
     --eval '(setq load-prefer-newer t)' \
     --eval '
 (progn
@@ -33,12 +42,12 @@ for source in lisp/ebp*.el; do
       (kill-emacs 1))))'
   guard_count=$((guard_count + 1))
 done
-test "$guard_count" -ge 6
+test "$guard_count" -ge 7
 
 compile_dir=$(mktemp -d)
 trap 'rm -rf "$compile_dir"' EXIT
 for source in lisp/*.el; do
-  emacs -Q --batch -L lisp \
+  emacs -Q --batch -L lisp -L "$websocket_dir" \
     --eval "(progn
       (setq load-prefer-newer t byte-compile-error-on-warn t)
       (setq byte-compile-dest-file-function
@@ -49,8 +58,9 @@ for source in lisp/*.el; do
     -f batch-byte-compile "$source"
 done
 
-for suite in ebp-wire-test ebp-store-test ebp-sync-test ebp-complete-test; do
-  emacs -Q --batch -L lisp -L test \
+for suite in ebp-wire-test ebp-store-test ebp-revision-test ebp-sync-test \
+             ebp-complete-test ebp-websocket-test; do
+  emacs -Q --batch -L lisp -L test -L "$websocket_dir" \
     --eval '(setq load-prefer-newer t)' \
     -l "test/$suite.el" -f ert-run-tests-batch-and-exit
 done

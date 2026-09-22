@@ -10,11 +10,15 @@
 ;; EventId receipt and its durable work item in one BEGIN IMMEDIATE
 ;; transaction.  Application work always runs outside that transaction.
 ;;
-;; One prior on-disk format shipped: an unversioned flat table
+;; Two prior on-disk formats shipped.  An unversioned flat table
 ;; `receipts (event_id TEXT PRIMARY KEY, ts REAL)', process-wide and not
-;; partitioned by pairing.  `ebp-sqlite-open' migrates such a file in
-;; place, atomically, into schema version 1 under the caller-supplied
-;; adopting pairing partition; no other unversioned layout is adopted.
+;; partitioned by pairing: `ebp-sqlite-open' migrates such a file in
+;; place, atomically, under the caller-supplied adopting pairing
+;; partition; no other unversioned layout is adopted.  And schema version
+;; 1 (receipts and work only): version 2 adds the per-pairing
+;; `surface_floors' table that persists SPEC 13.1's next revision per
+;; surface, and a version-1 file is upgraded in place in one checked
+;; transaction.
 ;;
 ;; Emacs 30.1's `with-sqlite-transaction' can return the body value after a
 ;; false `sqlite-commit' result, so this backend intentionally uses a small
@@ -27,7 +31,7 @@
 (require 'subr-x)
 (require 'ebp-store)
 
-(defconst ebp-sqlite-schema-version 1
+(defconst ebp-sqlite-schema-version 2
   "Current `ebp-sqlite' schema version.")
 
 (defconst ebp-sqlite-busy-timeout-ms 5000
@@ -188,30 +192,77 @@
            ON action_work(state, available_at_ms, work_id)")
   "Schema version 1's table and index DDL, in dependency order.")
 
+(defconst ebp-sqlite--schema-v2-ddl
+  (list
+   "CREATE TABLE surface_floors (
+           pairing_id TEXT NOT NULL,
+           surface TEXT NOT NULL,
+           revision INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL,
+           PRIMARY KEY (pairing_id, surface),
+           FOREIGN KEY (pairing_id)
+             REFERENCES pairing_partitions(pairing_id) ON DELETE CASCADE,
+           CHECK (revision >= 0)
+         )")
+  "The DDL schema version 2 adds on top of version 1.
+`surface_floors' is SPEC 13.1's persistent per-surface revision: the
+highest revision this pairing ever reserved for a send or absorbed from a
+welcome or result floor.")
+
+(defconst ebp-sqlite--schema-tables
+  '("accepted_events" "action_work" "pairing_partitions" "surface_floors")
+  "The complete sorted user-table list of the current schema version.")
+
 (defconst ebp-sqlite--legacy-receipts-tables '("receipts")
   "The complete user-table list of the shipped pre-v1 flat receipt store.")
 
 (defun ebp-sqlite--install-schema-tables (db)
-  "Create schema version 1's tables and indexes in DB.
+  "Create the current schema version's tables and indexes in DB.
 The caller owns the transaction and the `user_version' stamp."
-  (dolist (statement ebp-sqlite--schema-ddl)
+  (dolist (statement (append ebp-sqlite--schema-ddl ebp-sqlite--schema-v2-ddl))
     (sqlite-execute db statement)))
 
+(defun ebp-sqlite--stamp-version (db)
+  "Stamp DB with the current schema version inside the caller's transaction.
+A transactional header field: a rollback restores the prior version."
+  (sqlite-execute db (format "PRAGMA user_version = %d"
+                             ebp-sqlite-schema-version)))
+
 (defun ebp-sqlite--create-schema (store)
-  "Create STORE's complete schema version 1 in one transaction."
+  "Create STORE's complete current schema in one transaction."
   (let ((db (ebp-sqlite--db store)))
     (ebp-sqlite--call-with-transaction
      store
      (lambda ()
        (ebp-sqlite--install-schema-tables db)
-       (sqlite-execute db "PRAGMA user_version = 1")
+       (ebp-sqlite--stamp-version db)
+       t))))
+
+(defun ebp-sqlite--migrate-v1-to-v2 (store)
+  "Upgrade STORE's schema version 1 file to version 2 in one transaction.
+Receipts and work are untouched; the upgrade only adds `surface_floors'
+and restamps the version.  A failure anywhere rolls the file back to an
+ordinary version 1 store."
+  (let ((db (ebp-sqlite--db store)))
+    (unless (equal (ebp-sqlite--user-tables db)
+                   '("accepted_events" "action_work" "pairing_partitions"))
+      (signal 'ebp-store-error
+              '("SQLite EBP schema tables do not match v1")))
+    (ebp-sqlite--call-with-transaction
+     store
+     (lambda ()
+       (dolist (statement ebp-sqlite--schema-v2-ddl)
+         (sqlite-execute db statement))
+       (ebp-sqlite--fault 'after-v2-upgrade)
+       (ebp-sqlite--stamp-version db)
        t))))
 
 (defun ebp-sqlite--verify-schema (db)
-  "Fail closed unless DB is the complete, healthy schema version 1."
-  (unless (equal (ebp-sqlite--user-tables db)
-                 '("accepted_events" "action_work" "pairing_partitions"))
-    (signal 'ebp-store-error '("SQLite EBP schema tables do not match v1")))
+  "Fail closed unless DB is the complete, healthy current schema version."
+  (unless (equal (ebp-sqlite--user-tables db) ebp-sqlite--schema-tables)
+    (signal 'ebp-store-error
+            (list (format "SQLite EBP schema tables do not match v%d"
+                          ebp-sqlite-schema-version))))
   (unless (equal (sqlite-select db "PRAGMA integrity_check") '(("ok")))
     (signal 'ebp-store-error '("SQLite EBP integrity check failed")))
   (when (sqlite-select db "PRAGMA foreign_key_check")
@@ -265,7 +316,7 @@ failing closed rather than silently dropping an accepted commitment."
        (ebp-sqlite--fault 'after-legacy-import)
        (sqlite-execute db "DROP TABLE receipts")
        ;; A transactional header field: a rollback restores version 0.
-       (sqlite-execute db "PRAGMA user_version = 1")
+       (ebp-sqlite--stamp-version db)
        t))))
 
 (defun ebp-sqlite-open (file &optional legacy-pairing-id)
@@ -274,7 +325,8 @@ failing closed rather than silently dropping an accepted commitment."
 LEGACY-PAIRING-ID names the partition that adopts an unversioned pre-v1
 flat `receipts' table found at FILE; without it such a file is refused.
 Migration is atomic and in place, and no other unversioned non-empty
-layout is ever adopted."
+layout is ever adopted.  A schema version 1 file is upgraded to the
+current version in place, atomically, with no pairing id needed."
   (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
     (signal 'ebp-store-unavailable '("Emacs was built without SQLite")))
   (unless (stringp file)
@@ -312,6 +364,8 @@ layout is ever adopted."
                       (signal
                        'ebp-store-error
                        '("Unversioned non-empty SQLite store refused"))))))
+                 ((= version 1)
+                  (ebp-sqlite--migrate-v1-to-v2 store))
                  ((/= version ebp-sqlite-schema-version)
                   (signal 'ebp-store-error
                           (list (format "Unsupported SQLite EBP schema %s"
@@ -339,6 +393,21 @@ layout is ever adopted."
   "Require VALUE to be a non-negative integer timestamp named NAME."
   (unless (and (integerp value) (>= value 0))
     (signal 'wrong-type-argument (list name value))))
+
+(defun ebp-sqlite--require-surface (surface)
+  "Require SURFACE to be a SPEC 13.1 Surface ID."
+  (unless (and (stringp surface)
+               (<= (string-bytes surface) 128)
+               (string-match-p
+                "\\`\\(?:app\\|notification\\|widget\\|tile\\):\
+[A-Za-z0-9][A-Za-z0-9._:/-]*\\'"
+                surface))
+    (signal 'wrong-type-argument (list 'ebp-surface-id surface))))
+
+(defun ebp-sqlite--require-revision (revision)
+  "Require REVISION to be a non-negative integer."
+  (unless (and (integerp revision) (>= revision 0))
+    (signal 'wrong-type-argument (list 'ebp-revision revision))))
 
 (defun ebp-sqlite--require-action (action)
   "Require ACTION to be an EBP namespaced identifier."
@@ -492,6 +561,51 @@ The handle stays valid: a failed query says nothing about the store."
           (t
            (ebp-sqlite--fault 'after-completed-receipt)
            'admitted)))))))
+
+(cl-defmethod ebp-store-surface-floors
+  ((store ebp-sqlite-store) pairing-id)
+  (ebp-sqlite--require-id pairing-id 'ebp-pairing-id)
+  (mapcar (lambda (row) (cons (car row) (cadr row)))
+          (ebp-sqlite--select (ebp-sqlite--db store)
+                              "SELECT surface, revision FROM surface_floors
+                                WHERE pairing_id = ? ORDER BY surface"
+                              (list pairing-id))))
+
+(cl-defmethod ebp-store-raise-floor
+  ((store ebp-sqlite-store) pairing-id surface revision now-ms)
+  (ebp-sqlite--require-id pairing-id 'ebp-pairing-id)
+  (ebp-sqlite--require-surface surface)
+  (ebp-sqlite--require-revision revision)
+  (ebp-sqlite--require-time now-ms 'ebp-now-ms)
+  (let ((db (ebp-sqlite--db store)))
+    (ebp-sqlite--call-with-transaction
+     store
+     (lambda ()
+       (sqlite-execute
+        db
+        "INSERT OR IGNORE INTO pairing_partitions
+           (pairing_id, created_at_ms) VALUES (?, ?)"
+        (list pairing-id now-ms))
+       ;; Floors only rise: an existing higher row keeps its revision.
+       (sqlite-execute
+        db
+        "INSERT INTO surface_floors
+           (pairing_id, surface, revision, updated_at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (pairing_id, surface) DO UPDATE
+             SET revision = max(revision, excluded.revision),
+                 updated_at_ms = excluded.updated_at_ms"
+        (list pairing-id surface revision now-ms))
+       (ebp-sqlite--fault 'after-floor-write)
+       (let ((floor (ebp-sqlite--scalar
+                     db
+                     "SELECT revision FROM surface_floors
+                       WHERE pairing_id = ? AND surface = ?"
+                     (list pairing-id surface))))
+         (unless (and (integerp floor) (>= floor revision))
+           (signal 'ebp-store-error
+                   '("Surface floor did not persist as requested")))
+         floor)))))
 
 (cl-defmethod ebp-store-claim-next
   ((store ebp-sqlite-store) worker-id now-ms lease-ms &optional pairing-id)

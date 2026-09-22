@@ -75,6 +75,26 @@ Return exactly `admitted' after the receipt commits, or `duplicate' when the
 pairing already owns EVENT-ID (with or without work).  Signal
 `ebp-store-error' for every storage ambiguity or failure.")
 
+(cl-defgeneric ebp-store-surface-floors (store pairing-id)
+  "Return PAIRING-ID's durable surface revision floors from STORE.
+
+The value is a list of (SURFACE . REVISION) conses, one per surface the
+partition has ever reserved a revision for or absorbed a floor from.
+SPEC 13.1 requires Emacs to persist its next revision per surface; SPEC
+10.3 step 1 and 13.2 make every reported floor an absorption point that
+is persisted the same way.  Signal `ebp-store-error' on any storage
+failure.")
+
+(cl-defgeneric ebp-store-raise-floor (store pairing-id surface revision now-ms)
+  "Durably raise PAIRING-ID's floor for SURFACE to at least REVISION.
+
+SURFACE is a SPEC 13.1 Surface ID (a namespace prefix, then a SPEC 4.4
+identifier, at most 128 bytes); REVISION is a non-negative integer;
+NOW-MS is the caller-supplied local timestamp.  Floors only ever rise:
+the stored value becomes max(stored, REVISION), committed in STORE before
+this returns.  Return the resulting durable floor.  Signal
+`ebp-store-error' for every storage ambiguity or failure.")
+
 (cl-defgeneric ebp-store-claim-next
     (store worker-id now-ms lease-ms &optional pairing-id)
   "Atomically claim the oldest runnable work in STORE.
