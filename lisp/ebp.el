@@ -10,7 +10,7 @@
 ;; (SPEC 6), envelope conventions (SPEC 7),
 ;; the JSON data-model receiver rules this layer owns (SPEC 4.1),
 ;; pairing/proof construction (SPEC 9), and a pure client session state
-;; machine and reconnect lifecycle (SPEC 5.6, 10.1).  Transport wiring is
+;; machine and reconnect lifecycle (SPEC 5.7, 10.1).  Transport wiring is
 ;; generic EBP endpoint behavior; no Jetpacs application policy lives here.
 ;;
 ;; Durable SPEC 14.4 EventId receipts are delegated to `ebp-store.el' and
@@ -85,7 +85,7 @@ Emacs is the dialer, so Emacs alone can re-establish a transport the
 Companion's platform tore down — an Android process kill, a desktop
 Companion restart, a phone that left the network.  The default keeps one
 logical endpoint alive across those.  Redials use the jittered bounded
-backoff SPEC 5.6 requires of the dialing endpoint.  An explicit
+backoff SPEC 5.7 requires of the dialing endpoint.  An explicit
 `session.superseded' notification, a refused transport (a `network-tls'
 certificate mismatch, a Unix socket owned by another user), and
 `ebp-client-close' all stop automatic redial.  A connection's
@@ -93,14 +93,14 @@ certificate mismatch, a Unix socket owned by another user), and
   :type 'boolean)
 
 (defcustom ebp-reconnect-initial-delay 1
-  "Initial seconds before an automatic transport redial (SPEC 5.6).
+  "Initial seconds before an automatic transport redial (SPEC 5.7).
 Each failed attempt doubles the base delay up to
 `ebp-reconnect-max-delay'; every scheduled delay is jittered.  A
 connection's :reconnect-initial-delay config overrides this option."
   :type 'number)
 
 (defcustom ebp-reconnect-max-delay 15
-  "Ceiling in seconds for automatic transport redial backoff (SPEC 5.6).
+  "Ceiling in seconds for automatic transport redial backoff (SPEC 5.7).
 The actual delay is jittered below this ceiling.  A connection's
 :reconnect-max-delay config overrides this option."
   :type 'number)
@@ -388,6 +388,30 @@ the result outside it, as the process-filter wrapper in
       (ebp--check-numbers value)
       value)))
 
+(defun ebp--decoder-next (decoder)
+  "Split the next complete frame off DECODER; return its unibyte body or nil.
+The SPEC 6.2 framing half of the receiver: the header-section bound, the
+`ebp--parse-header' close rules, and partial-frame retention across reads.
+Signals `ebp-frame-close'.  Nil means no complete frame is buffered."
+  (let* ((buf (ebp-decoder-buffer decoder))
+         (term (string-search "\r\n\r\n" buf)))
+    (cond
+     ((null term)
+      ;; SPEC 6.2: the header section may not exceed 8,192 octets.
+      (when (> (length buf) ebp-max-header-octets)
+        (signal 'ebp-frame-close (list "header section too large")))
+      nil)
+     ((> (+ term 4) ebp-max-header-octets)
+      (signal 'ebp-frame-close (list "header section too large")))
+     (t
+      (let* ((len (ebp--parse-header (substring buf 0 term)))
+             (body-start (+ term 4))
+             (body-end (+ body-start len)))
+        (if (< (length buf) body-end)
+            nil                     ; retain partial data across reads
+          (setf (ebp-decoder-buffer decoder) (substring buf body-end))
+          (substring buf body-start body-end)))))))
+
 (defun ebp-decoder-feed (decoder bytes)
   "Feed unibyte BYTES into DECODER; return the list of complete messages.
 Implements the SPEC 6.2 receiver.  Signals `ebp-frame-close',
@@ -395,27 +419,9 @@ Implements the SPEC 6.2 receiver.  Signals `ebp-frame-close',
 assigns to each."
   (setf (ebp-decoder-buffer decoder)
         (concat (ebp-decoder-buffer decoder) bytes))
-  (let ((messages '()) (done nil))
-    (while (not done)
-      (let* ((buf (ebp-decoder-buffer decoder))
-             (term (string-search "\r\n\r\n" buf)))
-        (cond
-         ((null term)
-          ;; SPEC 6.2: the header section may not exceed 8,192 octets.
-          (when (> (length buf) ebp-max-header-octets)
-            (signal 'ebp-frame-close (list "header section too large")))
-          (setq done t))
-         ((> (+ term 4) ebp-max-header-octets)
-          (signal 'ebp-frame-close (list "header section too large")))
-         (t
-          (let* ((len (ebp--parse-header (substring buf 0 term)))
-                 (body-start (+ term 4))
-                 (body-end (+ body-start len)))
-            (if (< (length buf) body-end)
-                (setq done t)       ; retain partial data across reads
-              (setf (ebp-decoder-buffer decoder) (substring buf body-end))
-              (push (ebp--parse-body (substring buf body-start body-end))
-                    messages)))))))
+  (let ((messages '()) body)
+    (while (setq body (ebp--decoder-next decoder))
+      (push (ebp--parse-body body) messages))
     (nreverse messages)))
 
 (defun ebp-decoder-finish (decoder)
@@ -717,7 +723,7 @@ them.")
                   ;        :wants, :receipt-file, and for tests :client-nonce
   connection      ; jsonrpc-process-connection
   ;; SPEC 5.2-5.4 transport identity (`host' is the socket path under
-  ;; loopback-unix) and the SPEC 5.6 logical-endpoint lifecycle.  A client
+  ;; loopback-unix) and the SPEC 5.7 logical-endpoint lifecycle.  A client
   ;; object survives ordinary Companion process death: only its transport and
   ;; session-scoped mirrors are replaced.  `terminal-p' distinguishes an
   ;; explicit/protocol close from the transient CLOSED state between redials.
@@ -809,7 +815,7 @@ them.")
   outstanding-held ; sticky refusal latch until <= `ebp-overload-resume'
   inbound-paused   ; reading stopped for transport backpressure
   overloaded       ; 1401 sent, close in progress — the rate-limit latch
-  ;; SPEC 5.6 under a binder profile (SPEC 5.5): a CANDIDATE is a shallow
+  ;; SPEC 5.7 under a binder profile (SPEC 5.5): a CANDIDATE is a shallow
   ;; copy of the logical client that runs one handshake on one accepted
   ;; connection; `parent' is the logical client it is adopted into at
   ;; welcome-verified (`ebp-client--adopt'), nil on every real client.
@@ -911,7 +917,7 @@ ends the logical endpoint."
 (defun ebp--reconnect-jitter (base)
   "Return a jittered delay in [0.75 * BASE, BASE].
 Randomizing even the capped attempts prevents two local authorities whose
-transports failed together from redialing in lockstep (SPEC 5.6)."
+transports failed together from redialing in lockstep (SPEC 5.7)."
   (* base (+ 0.75 (/ (random 250001) 1000000.0))))
 
 (defun ebp-client--cancel-session-work (client)
@@ -949,7 +955,7 @@ session identities do not."
 
 (defun ebp-client--schedule-reconnect (client)
   "Schedule CLIENT's next automatic dial with jittered bounded backoff.
-Only a dialing endpoint redials (SPEC 5.6): under a binder profile the
+Only a dialing endpoint redials (SPEC 5.7): under a binder profile the
 listener keeps accepting and the Companion is the one that redials, so
 this is a no-op there and the logical client simply waits, `closed' but
 active, for the next accepted connection."
@@ -1020,7 +1026,7 @@ so the next session cannot race callbacks owned by the dead transport."
 
 (defun ebp-client--make-candidate (client)
   "A candidate session for CLIENT: a shallow copy that runs one handshake.
-SPEC 5.6 under a binder profile: every accepted connection attempts the
+SPEC 5.7 under a binder profile: every accepted connection attempts the
 Section 9 handshake while the logical endpoint's session stays live, so
 each attempt needs session state of its own.  The copy shares everything
 durable or application-owned BY REFERENCE — config, handlers, actions,
@@ -1099,7 +1105,7 @@ bypasses the pure machine; the candidate reached `syncing' through
         parent))))
 
 (defun ebp-client--handle-session-superseded (client _params)
-  "Stand CLIENT down after `session.superseded' (SPEC 5.6).
+  "Stand CLIENT down after `session.superseded' (SPEC 5.7).
 Explicit supersession is terminal for automatic reconnect.  A later manual
 `ebp-connect' is user intent and may create a new logical endpoint.
 Under a binder profile the notification is not used (SPEC 5.5): a
@@ -1332,7 +1338,7 @@ that MUST follow the report makes a second report impossible."
     (if (and (eq (ebp-client--transport-role client) 'binder)
              (null (ebp-client-parent client)))
         ;; SPEC 22.3 closes the CONNECTION; a listener keeps listening and
-        ;; the Companion redials with backoff (SPEC 5.6).
+        ;; the Companion redials with backoff (SPEC 5.7).
         (when-let* ((conn (ebp-client-connection client)))
           (ignore-errors (jsonrpc-shutdown conn)))
       (ebp-client-close client (list 'overloaded why)))))
@@ -3002,12 +3008,337 @@ remain the authored-tree form; this is the out-of-band raise."
    ;; dialog: floor a configured ceiling at 60 s.
    (or (ebp-client--user-paced-timeout ebp-dialog-timeout) 'none)))
 
+;;;; Binder profiles (SPEC 5.7): the pre-authentication pool
+
+;; Under a profile in which Emacs binds (SPEC 5.5 `loopback-websocket',
+;; SPEC 5.6 `emacs-unix') every accepted connection attempts the Section 9
+;; handshake on a CANDIDATE client while the logical client's session
+;; stays live.  SPEC 5.7 bounds those attempts: at most
+;; `ebp-binder-max-pending' concurrent pre-authentication connections, each
+;; closed after `ebp--binder-preauth-deadline' seconds, and when the bound
+;; is reached a new dial evicts the OLDEST rather than being refused —
+;; newest wins, mirroring supersession.  Nothing in that rule is
+;; transport-specific, so the pool lives here and each binder module
+;; supplies only its accept, its socket close, and its connection class.
+
+(defcustom ebp-binder-max-pending 8
+  "Bound on concurrent pre-authentication connections (SPEC 5.7).
+When reached, a new dial evicts the OLDEST pending connection — newest
+wins, mirroring supersession — rather than being refused.  Applies to
+every profile under which Emacs binds."
+  :type 'integer)
+
+(defvar ebp--binder-preauth-deadline 10
+  "Seconds an accepted connection has to finish the Section 9 handshake.
+SPEC 5.7 fixes it at 10; not a user option.  Tests bind it shorter.")
+
+(cl-defstruct (ebp--binder (:constructor ebp--make-binder))
+  "A binding client's listener state, held in `ebp-client-transport-state'.
+CLIENT is the logical client; PROCESS the listening process; ADDRESS the
+port or path it is bound to; PENDING the pre-authentication pool, oldest
+first; CLOSE-SOCKET a function of one bare (candidate-less) socket that
+closes it, defaulting to `delete-process'."
+  client process address (pending nil) close-socket)
+
+(cl-defstruct (ebp--pending (:constructor ebp--make-pending))
+  "One pooled connection: its SOCKET, ACCEPTED-AT, deadline TIMER, and the
+CANDIDATE running its handshake, nil until one exists."
+  socket accepted-at timer candidate)
+
+(defun ebp--binder (client)
+  "CLIENT's `ebp--binder', or nil for a dialer or an unbound binder."
+  (let ((state (ebp-client-transport-state client)))
+    (and (ebp--binder-p state) state)))
+
+(cl-defun ebp--binder-find-pending (binder &key socket candidate)
+  "BINDER's pending entry for SOCKET or CANDIDATE, or nil."
+  (cl-find-if (lambda (entry)
+                (or (and socket (eq (ebp--pending-socket entry) socket))
+                    (and candidate
+                         (eq (ebp--pending-candidate entry) candidate))))
+              (ebp--binder-pending binder)))
+
+(defun ebp--binder-forget (binder entry)
+  "Remove ENTRY from BINDER's pool and cancel its deadline."
+  (when-let* ((timer (ebp--pending-timer entry)))
+    (ignore-errors (cancel-timer timer))
+    (setf (ebp--pending-timer entry) nil))
+  (setf (ebp--binder-pending binder)
+        (delq entry (ebp--binder-pending binder))))
+
+(defun ebp--binder-drop-pending (binder entry reason)
+  "Forget ENTRY and close what it holds: a candidate, or a bare socket."
+  (ebp--binder-forget binder entry)
+  (let ((candidate (ebp--pending-candidate entry))
+        (socket (ebp--pending-socket entry)))
+    (cond
+     (candidate (ebp-client-close candidate reason))
+     ((and socket (process-live-p socket))
+      (funcall (or (ebp--binder-close-socket binder) #'delete-process)
+               socket)))))
+
+(defun ebp--binder-expire (binder entry)
+  "SPEC 5.7: ENTRY did not authenticate within the deadline."
+  (when (memq entry (ebp--binder-pending binder))
+    (ebp--binder-drop-pending binder entry '(preauth-timeout))))
+
+(defun ebp--binder-admit (binder socket)
+  "Admit SOCKET to BINDER's pool, newest wins; return its entry.
+The deadline clock starts here, at accept, so a connection that never
+sends a byte is bounded as well.  Evicts the oldest entries while the
+pool is at `ebp-binder-max-pending'."
+  (while (>= (length (ebp--binder-pending binder))
+             (max 1 ebp-binder-max-pending))
+    (ebp--binder-drop-pending binder (car (ebp--binder-pending binder))
+                              '(preauth-evicted)))
+  (let ((entry (ebp--make-pending :socket socket :accepted-at (float-time))))
+    (setf (ebp--pending-timer entry)
+          (run-at-time ebp--binder-preauth-deadline nil
+                       #'ebp--binder-expire binder entry)
+          (ebp--binder-pending binder)
+          (append (ebp--binder-pending binder) (list entry)))
+    entry))
+
+(defun ebp--binder-start-candidate (binder socket conn)
+  "Run one handshake for BINDER's client over CONN, an accepted SOCKET.
+Creates the candidate (`ebp-client--make-candidate'), points CONN and the
+pool entry at it, and sends `session.hello'.  A hello that cannot be
+written closes the candidate as `(hello-failed ERR)'.  Returns the
+candidate."
+  (let* ((client (ebp--binder-client binder))
+         (candidate (ebp-client--make-candidate client)))
+    (setf (ebp-client-connection candidate) conn
+          (ebp-client-process candidate) socket
+          (ebp--connection-client conn) candidate)
+    (if-let* ((entry (ebp--binder-find-pending binder :socket socket)))
+        (setf (ebp--pending-candidate entry) candidate)
+      ;; Accepted before the pool saw it; still bound it by the deadline.
+      (setf (ebp--pending-candidate (ebp--binder-admit binder socket))
+            candidate))
+    (condition-case err
+        (ebp-client-start candidate)
+      (error
+       (message "ebp: session.hello failed (%s); closing" (car err))
+       (ebp-client-close candidate (list 'hello-failed (car err)))))
+    candidate))
+
+(defun ebp--binder-adopted (client candidate)
+  "Registry `:adopt' for every binder: CANDIDATE became CLIENT's session."
+  (when-let* ((binder (ebp--binder client))
+              (entry (ebp--binder-find-pending binder :candidate candidate)))
+    (ebp--binder-forget binder entry)))
+
+(defun ebp--binder-close (client &optional close-listener)
+  "Drop every pending candidate of CLIENT, then its listener.
+CLOSE-LISTENER, a function of the listening process, defaults to
+`delete-process'.  Clears `ebp-client-transport-state'."
+  (when-let* ((binder (ebp--binder client)))
+    (dolist (entry (copy-sequence (ebp--binder-pending binder)))
+      (ebp--binder-drop-pending binder entry '(listener-closed)))
+    (let ((proc (ebp--binder-process binder)))
+      (when (and proc (process-live-p proc))
+        (ignore-errors (funcall (or close-listener #'delete-process) proc))))
+    (setf (ebp-client-transport-state client) nil)))
+
+(defun ebp--binder-connection-lost (conn)
+  "CONN's transport is gone: forget its pool entry and close its candidate.
+An adopted connection reaches the logical client through CONN's
+`:on-shutdown' (`ebp-client--transport-lost'); a candidate is closed
+here as `(transport-lost)', which is terminal for the candidate only."
+  (when-let* ((c (ebp--connection-client conn)))
+    (when-let* ((parent (ebp-client-parent c))
+                (binder (ebp--binder parent))
+                (entry (ebp--binder-find-pending binder :candidate c)))
+      (ebp--binder-forget binder entry))
+    (when (ebp-client-parent c)
+      (ebp-client-close c '(transport-lost)))))
+
+;;;; Binder profiles: the strict receiver (SPEC 6.2 REQUIRED of a binding Emacs)
+
+(defun ebp--reply-error (conn id code message kind)
+  "Answer a body fault on CONN with a SPEC 8 error response; ID may be nil."
+  (ignore-errors
+    (jsonrpc-connection-send conn :id id
+                             :error (list :code code :message message
+                                          :data (list :kind kind)))))
+
+(defun ebp--schedule-message (conn msg)
+  "Deliver MSG on CONN from a 0-delay timer whose args are (CONN MSG).
+Byte-for-byte jsonrpc.el's own delivery shape (jsonrpc.el 883-897), so
+`ebp-client--backlog' counts it and `ebp--isolate-parsed-messages'
+rewrites it; timers cannot fire inside a process filter, so ordering
+matches the process transport."
+  (let ((timer (timer-create)))
+    (timer-set-time timer (current-time))
+    (timer-set-function timer
+                        (lambda (c m)
+                          (with-temp-buffer
+                            (jsonrpc-connection-receive c m)))
+                        (list conn msg))
+    (timer-activate timer)))
+
+(defun ebp--receive-strict (conn bytes)
+  "Decode one complete message body BYTES under the SPEC 4.1/6.2 receiver rules.
+A parse fault answers -32700, an invalid request -32600, both with id
+null unless the message carried a valid one, and the connection continues
+\(SPEC 6.2).  A valid message is scheduled for dispatch and then run
+through `ebp--isolate-parsed-messages' for the unknown-method sentinel."
+  (let* ((client (ebp--connection-client conn))
+         (msg (condition-case err
+                  (let ((parsed (let ((obarray (obarray-make)))
+                                  (ebp--parse-message bytes))))
+                    (ebp--remap-decoded parsed)
+                    (ebp--validate-message-plist parsed))
+                (ebp-parse-error
+                 (ebp--reply-error conn nil -32700 "Parse error" "parse-error")
+                 nil)
+                (ebp-invalid-request
+                 (ebp--reply-error conn (nth 1 (cdr err)) -32600
+                                   "Invalid Request" "invalid-request")
+                 nil))))
+    (when msg
+      (when ebp-log-events
+        (setq msg (plist-put msg :jsonrpc-json (ebp--decode-utf-8 bytes))))
+      (ebp--schedule-message conn msg)
+      (when client (ebp--isolate-parsed-messages client)))))
+
+;;;; Binder profiles: a strict Content-Length connection over a process
+
+;; `ebp--connection' rents jsonrpc.el's process transport and its tolerant
+;; reader, which SPEC 6.2 permits a DIALING Emacs.  A binding Emacs owes
+;; the strict receiver (SPEC 5.6), so this class owns the process filter
+;; itself and runs the reference decoder: `ebp--decoder-next' for framing,
+;; `ebp--receive-strict' for each body.  Everything above the socket —
+;; dispatchers, continuations, events — is jsonrpc.el's `jsonrpc-connection'.
+
+(defclass ebp--strict-process-connection (ebp--endpoint-mixin jsonrpc-connection)
+  ((process :initarg :process :initform nil
+            :accessor ebp--strict-connection-process)
+   (decoder :initform nil :accessor ebp--strict-connection-decoder)
+   (on-shutdown :initarg :on-shutdown :initform #'ignore
+                :accessor ebp--strict-connection-on-shutdown)
+   (shutdown-started :initform nil
+                     :accessor ebp--strict-connection-shutdown-started))
+  "One accepted stream socket, Content-Length framed, strictly decoded.")
+
+(cl-defmethod initialize-instance :after ((conn ebp--strict-process-connection) _slots)
+  "Take ownership of CONN's process: binary coding, our filter and sentinel."
+  (let ((proc (ebp--strict-connection-process conn)))
+    (setf (ebp--strict-connection-decoder conn) (ebp-make-decoder))
+    (process-put proc :ebp-connection conn)
+    (set-process-coding-system proc 'binary 'binary)
+    (set-process-filter proc #'ebp--strict-filter)
+    (set-process-sentinel proc #'ebp--strict-sentinel)))
+
+(defun ebp--strict-live-p (conn)
+  "Non-nil while CONN's process is open and no shutdown has begun."
+  (let ((proc (ebp--strict-connection-process conn)))
+    (and proc (not (ebp--strict-connection-shutdown-started conn))
+         (process-live-p proc))))
+
+(cl-defmethod jsonrpc-connection-send ((conn ebp--strict-process-connection)
+                                       &rest args
+                                       &key id method _params
+                                       (_result nil result-supplied-p) error
+                                       &allow-other-keys)
+  "SPEC 6.1 sender: one message, serialized under 4.1, in exact framing.
+SPEC 4.5's sender bound applies: a body over `ebp-max-body-octets'
+signals `ebp-frame-close' from `ebp-encode-frame', and
+`ebp-client--request' rolls its claim back."
+  (let* ((method (cond ((null method) nil)
+                       ((keywordp method) (substring (symbol-name method) 1))
+                       ((symbolp method) (symbol-name method))
+                       ((stringp method) method)
+                       (t (error "ebp: bad method %S" method))))
+         (message (cl-loop for (k v) on (copy-sequence args) by #'cddr
+                           unless (eq k :partial)
+                           append (list k (if (eq k :method) method v))))
+         (kind (cond ((or result-supplied-p error) 'reply)
+                     (id 'request)
+                     (method 'notification)))
+         (converted (jsonrpc-convert-to-endpoint conn message kind))
+         (json (json-serialize converted :null-object nil :false-object :json-false))
+         (frame (ebp-encode-frame json)))
+    (unless (ebp--strict-live-p conn)
+      (error "ebp: connection is closed"))
+    (process-send-string (ebp--strict-connection-process conn) frame)
+    (jsonrpc--event conn 'client :json json :kind kind
+                    :message message :foreign-message converted)))
+
+(cl-defmethod jsonrpc-running-p ((conn ebp--strict-process-connection))
+  (ebp--strict-live-p conn))
+
+(cl-defmethod jsonrpc-shutdown ((conn ebp--strict-process-connection) &optional _cleanup)
+  (ebp--strict-conclude conn t))
+
+(defun ebp--strict-conclude (conn close-socket)
+  "Conclude CONN once: fail its continuations locally, then run on-shutdown.
+The sentinel jsonrpc.el's process transport gets for free: every
+outstanding continuation's timer is cancelled and its error-fn called
+with code -1 (`ebp--transport-error-p'), after the continuation list has
+been cleared so a throwing error-fn cannot abandon the rest.  CLOSE-SOCKET
+non-nil also deletes the process; its sentinel then re-enters here and
+is inert."
+  (unless (ebp--strict-connection-shutdown-started conn)
+    (setf (ebp--strict-connection-shutdown-started conn) t)
+    (let ((conts (jsonrpc--continuations conn))
+          (proc (ebp--strict-connection-process conn)))
+      (setf (jsonrpc--continuations conn) nil)
+      (dolist (c conts)
+        (when-let* ((timer (nth 4 c)))
+          (ignore-errors (cancel-timer timer))))
+      (when (and close-socket proc (process-live-p proc))
+        (ignore-errors (delete-process proc)))
+      (dolist (c conts)
+        (condition-case err
+            (funcall (nth 3 c) '(:code -1 :message "Transport closed"))
+          (error (message "ebp: continuation error-fn failed (%s)" (car err)))))
+      (condition-case err
+          (funcall (ebp--strict-connection-on-shutdown conn) conn)
+        (error (message "ebp: on-shutdown failed (%s)" (car err)))))))
+
+(defun ebp--strict-filter (proc bytes)
+  "Feed unibyte BYTES from PROC through the strict receiver.
+Framing faults (`ebp-frame-close': a malformed header, an oversized
+declaration, a header section over the bound) close the connection as
+SPEC 6.2 requires; body faults are answered by `ebp--receive-strict' and
+the connection continues.  The SPEC 22.3 backlog check runs at the
+outermost exit, as for the dialer's filter wrapper."
+  (when-let* ((conn (process-get proc :ebp-connection)))
+    (unless (ebp--strict-connection-shutdown-started conn)
+      (let ((outermost (not ebp--in-filter))
+            (ebp--in-filter t)
+            (decoder (ebp--strict-connection-decoder conn)))
+        (unwind-protect
+            (condition-case err
+                (progn
+                  (setf (ebp-decoder-buffer decoder)
+                        (concat (ebp-decoder-buffer decoder) bytes))
+                  (let (body)
+                    (while (and (not (ebp--strict-connection-shutdown-started conn))
+                                (setq body (ebp--decoder-next decoder)))
+                      (ebp--receive-strict conn body))))
+              (ebp-frame-close
+               (message "ebp: closing connection (%s)" (cadr err))
+               (ignore-errors (jsonrpc-shutdown conn))))
+          (when outermost
+            (when-let* ((client (ebp--connection-client conn)))
+              (ebp-client--inbound-check client))))))))
+
+(defun ebp--strict-sentinel (proc _event)
+  "PROC changed state: once it is no longer live, conclude its connection."
+  (unless (process-live-p proc)
+    (when-let* ((conn (process-get proc :ebp-connection)))
+      (ebp--strict-conclude conn nil)
+      (ebp--binder-connection-lost conn))))
+
 ;;;; Transports (SPEC 5.2-5.4): jsonrpc-process-connection, unmodified
 
-;; Every profile this endpoint implements has Emacs as the dialer, which is
-;; why one reconnect lifecycle (SPEC 5.6) serves all of them and why the
-;; profile is chosen here, at the socket, and nowhere else: nothing above
-;; the process object knows or cares which one carried the bytes.
+;; Every profile this endpoint is REQUIRED to implement has Emacs as the
+;; dialer, which is why one reconnect lifecycle (SPEC 5.7) serves all of
+;; them and why the profile is chosen here, at the socket, and nowhere
+;; else: nothing above the process object knows or cares which one
+;; carried the bytes.  The binder profiles above invert only the socket.
 ;; `loopback-websocket' (SPEC 5.5) inverts the roles and needs a WebSocket
 ;; server Emacs does not ship; it belongs to the optional `ebp-websocket'
 ;; feature, never to this file.  What this file provides for it is the
@@ -3274,7 +3605,7 @@ Transport, framing, and id bookkeeping use core jsonrpc.el.  With
 automatic reconnect enabled (the default), an unavailable initial
 listener or later unexpected transport loss leaves the returned client
 active and schedules fresh handshakes with jittered bounded backoff
-\(SPEC 5.6).  `ebp-client-close' ends that lifecycle.
+\(SPEC 5.7).  `ebp-client-close' ends that lifecycle.
 
 :transport selects the SPEC 5 profile, one of `ebp-transports':
   `loopback-tcp' (the default; SPEC 5.2): HOST and PORT name the
@@ -3293,6 +3624,13 @@ optional `ebp-websocket' feature: HOST must be 127.0.0.1, PORT is the
 listener port (conventionally 8767), `:allowed-origins' is REQUIRED, the
 returned client is `closed' for `(listening)' until a Companion dials
 and authenticates, and it never redials.  `ebp-websocket-listen' is the
+documented entry point.
+
+`emacs-unix' (SPEC 5.6) is the other BINDER profile, provided by the
+optional built-ins-only `ebp-unix' feature: HOST is the absolute socket
+path (conventionally `ebp-unix-default-path'), PORT must be nil, the
+directory is secured as `server.el' secures its own, and the returned
+client behaves as under `loopback-websocket'.  `ebp-unix-listen' is the
 documented entry point.
 
 A misconfigured transport signals `error' before any client exists.  A

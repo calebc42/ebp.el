@@ -59,7 +59,7 @@ for source in lisp/*.el; do
 done
 
 for suite in ebp-wire-test ebp-store-test ebp-revision-test ebp-sync-test \
-             ebp-complete-test ebp-websocket-test; do
+             ebp-complete-test ebp-websocket-test ebp-unix-test; do
   emacs -Q --batch -L lisp -L test -L "$websocket_dir" \
     --eval '(setq load-prefer-newer t)' \
     -l "test/$suite.el" -f ert-run-tests-batch-and-exit

@@ -131,7 +131,7 @@ closures: :received :errors :closed-p :open-p :send :raw :stop."
           (should (object-of-class-p (ebp-client-connection client)
                                      'ebp-websocket--connection))
           (should (null (ebp-client-parent client)))
-          (should (null (ebp-websocket--listener-pending
+          (should (null (ebp--binder-pending
                          (ebp-websocket--listener client)))))
       (ebp-wstest--stop-all companion)
       (ebp-client-close client 'test-done))))
@@ -183,7 +183,7 @@ closures: :received :errors :closed-p :open-p :send :raw :stop."
       (ebp-client-close client 'test-done))))
 
 (ert-deftest ebp-websocket-test-transport-loss-waits-without-redial ()
-  "SPEC 5.6: the binder never redials; the next dial re-establishes."
+  "SPEC 5.7: the binder never redials; the next dial re-establishes."
   (let* ((ready 0)
          (client (ebp-wstest--listen :ready-function (lambda (_c) (cl-incf ready))))
          (a (ebp-wstest--dial client (ebp-test--kat-script)))
@@ -196,12 +196,12 @@ closures: :received :errors :closed-p :open-p :send :raw :stop."
           (should (equal (ebp-client-close-reason client) '(transport-lost)))
           (should (ebp-client-active-p client))
           (should-not (ebp-client-reconnect-timer client))
-          (should (process-live-p (ebp-websocket--listener-process
+          (should (process-live-p (ebp--binder-process
                                    (ebp-websocket--listener client))))
           ;; Explicit intent is harmless for a binder: still listening.
           (ebp-client-reconnect-now client)
           (should (ebp-client-active-p client))
-          (should (process-live-p (ebp-websocket--listener-process
+          (should (process-live-p (ebp--binder-process
                                    (ebp-websocket--listener client))))
           (setq b (ebp-wstest--dial client (ebp-test--kat-script)))
           (should (ebp-test--wait (lambda () (= ready 2))))
@@ -217,7 +217,7 @@ closures: :received :errors :closed-p :open-p :send :raw :stop."
     (unwind-protect
         (progn
           (should (ebp-test--wait (ebp-wstest--ready-p client)))
-          (let ((listener (ebp-websocket--listener-process
+          (let ((listener (ebp--binder-process
                            (ebp-websocket--listener client))))
             (ebp-client-close client 'test-done)
             (should (ebp-client-terminal-p client))
@@ -229,10 +229,10 @@ closures: :received :errors :closed-p :open-p :send :raw :stop."
       (ebp-wstest--stop-all a)
       (ebp-client-close client 'test-done))))
 
-;;;; SPEC 5.6: supersession and the pre-authentication pool
+;;;; SPEC 5.7: supersession and the pre-authentication pool
 
 (ert-deftest ebp-websocket-test-newest-authenticated-connection-supersedes ()
-  "SPEC 5.5/5.6: a newer AUTHENTICATED connection takes over; the older
+  "SPEC 5.5/5.7: a newer AUTHENTICATED connection takes over; the older
 session's outstanding requests conclude locally with -1."
   (let* ((ready 0)
          (client (ebp-wstest--listen :ready-function (lambda (_c) (cl-incf ready))))
@@ -260,7 +260,7 @@ session's outstanding requests conclude locally with -1."
             (should (ebp-test--wait (lambda () (funcall (plist-get a :closed-p)))))
             (should (equal swallowed '(nil (:code -1 :message "Transport closed"))))
             (should-not (ebp-client-terminal-p client))
-            (should (null (ebp-websocket--listener-pending
+            (should (null (ebp--binder-pending
                            (ebp-websocket--listener client))))
             ;; The new session is live: a request round-trips on it.
             (let (done)
@@ -273,7 +273,7 @@ session's outstanding requests conclude locally with -1."
       (ebp-client-close client 'test-done))))
 
 (ert-deftest ebp-websocket-test-failed-candidate-leaves-the-session-alone ()
-  "SPEC 5.6: an attempt that fails authentication disturbs nothing."
+  "SPEC 5.7: an attempt that fails authentication disturbs nothing."
   (let* ((ready 0)
          (client (ebp-wstest--listen :ready-function (lambda (_c) (cl-incf ready))))
          (a (ebp-wstest--dial client (ebp-test--kat-script)))
@@ -292,7 +292,7 @@ session's outstanding requests conclude locally with -1."
           (should (eq (ebp-client-state client) 'ready))
           (should-not (funcall (plist-get a :closed-p)))
           (should (ebp-test--wait
-                   (lambda () (null (ebp-websocket--listener-pending
+                   (lambda () (null (ebp--binder-pending
                                      (ebp-websocket--listener client))))))
           (let (done)
             (ebp-client-surface-update
@@ -303,9 +303,9 @@ session's outstanding requests conclude locally with -1."
       (ebp-client-close client 'test-done))))
 
 (ert-deftest ebp-websocket-test-preauth-pool-bound-and-deadline ()
-  "SPEC 5.6: a bounded pre-auth pool, newest wins, 10 s to authenticate."
-  (let* ((ebp-websocket--preauth-deadline 1.5)
-         (ebp-websocket-max-pending 2)
+  "SPEC 5.7: a bounded pre-auth pool, newest wins, 10 s to authenticate."
+  (let* ((ebp--binder-preauth-deadline 1.5)
+         (ebp-binder-max-pending 2)
          (client (ebp-wstest--listen))
          socks)
     (unwind-protect
@@ -320,13 +320,13 @@ session's outstanding requests conclude locally with -1."
           (setq socks (nreverse socks))
           ;; The oldest was evicted at the third accept ...
           (should (ebp-test--wait (lambda () (not (process-live-p (car socks))))))
-          (should (= 2 (length (ebp-websocket--listener-pending
+          (should (= 2 (length (ebp--binder-pending
                                 (ebp-websocket--listener client)))))
           ;; ... and the rest expire at the deadline.
           (should (ebp-test--wait
                    (lambda () (cl-every (lambda (s) (not (process-live-p s))) socks))
                    4))
-          (should (null (ebp-websocket--listener-pending
+          (should (null (ebp--binder-pending
                          (ebp-websocket--listener client))))
           (let ((c (ebp-wstest--dial client (ebp-test--kat-script))))
             (unwind-protect
@@ -410,7 +410,7 @@ connection keeps dispatching."
           (should (equal (ebp-client-close-reason client) '(transport-lost)))
           (should (ebp-client-active-p client))
           (should-not (ebp-client-reconnect-timer client))
-          (should (process-live-p (ebp-websocket--listener-process
+          (should (process-live-p (ebp--binder-process
                                    (ebp-websocket--listener client)))))
       (ebp-wstest--stop-all companion)
       (ebp-client-close client 'test-done))))

@@ -73,32 +73,30 @@ config overrides it.  Comparison is exact and ASCII case-insensitive;
 the opaque origin `null' can never be listed."
   :type '(repeat string))
 
-(defcustom ebp-websocket-max-pending 8
-  "Bound on concurrent pre-authentication connections (SPEC 5.6).
-When reached, a new dial evicts the OLDEST pending connection — newest
-wins, mirroring supersession — rather than being refused."
-  :type 'integer)
+(define-obsolete-variable-alias 'ebp-websocket-max-pending
+  'ebp-binder-max-pending "ebp 0.2"
+  "The SPEC 5.7 pre-authentication bound is shared by every binder profile.")
 
-(defvar ebp-websocket--preauth-deadline 10
-  "Seconds an accepted connection has to finish the Section 9 handshake.
-SPEC 5.6 fixes it at 10; not a user option.  Tests bind it shorter.")
+(defvaralias 'ebp-websocket--preauth-deadline 'ebp--binder-preauth-deadline
+  "The SPEC 5.7 handshake deadline, shared by every binder profile.")
 
 (defvar ebp-websocket--diagnostic-interval 10
   "Minimum seconds between `1400 frame-too-large' reports per connection.
 SPEC 22.3 requires `log.error' to be rate-limited; unlike 1401, a 1400
 keeps the connection open, so the once-per-connection latch cannot serve.")
 
-;;;; Listener and pending state
-
-(cl-defstruct (ebp-websocket--listener (:constructor ebp-websocket--make-listener))
-  client process port origins (pending nil))
-
-(cl-defstruct (ebp-websocket--pending (:constructor ebp-websocket--make-pending))
-  socket accepted-at timer candidate)
+;;;; Listener state
 
 (defun ebp-websocket--listener (client)
-  "CLIENT's listener struct, or nil."
-  (ebp-client-transport-state client))
+  "CLIENT's `ebp--binder' (ebp.el's shared SPEC 5.7 pool), or nil."
+  (ebp--binder client))
+
+(defun ebp-websocket--close-socket (socket)
+  "Close a pooled SOCKET that has no candidate yet: a close frame if it
+completed its upgrade, else a bare `delete-process'."
+  (if-let* ((ws (process-get socket :websocket)))
+      (ignore-errors (websocket-close ws))
+    (delete-process socket)))
 
 (defun ebp-websocket--client-origins (client)
   "The Origin allowlist for CLIENT."
@@ -226,12 +224,12 @@ ten other arguments are the library's own (websocket.el 884-894), and
 `:ebp-client' on the plist is the scoping marker both advices key on."
   (let ((existing (ebp-websocket--listener client)))
     (if (and existing
-             (process-live-p (ebp-websocket--listener-process existing)))
+             (process-live-p (ebp--binder-process existing)))
         existing
       (let* ((port (ebp-client-port client))
-             (listener (ebp-websocket--make-listener
-                        :client client :port port
-                        :origins (ebp-websocket--client-origins client)))
+             (listener (ebp--make-binder
+                        :client client :address port
+                        :close-socket #'ebp-websocket--close-socket))
              (proc (make-network-process
                     :name (format "ebp-websocket listener on %d" port)
                     :server t :family 'ipv4 :host 'local :service port
@@ -245,68 +243,23 @@ ten other arguments are the library's own (websocket.el 884-894), and
                                  :on-close #'ebp-websocket--on-close
                                  :on-error #'ebp-websocket--on-error
                                  :ebp-client client))))
-        (setf (ebp-websocket--listener-process listener) proc
+        (setf (ebp--binder-process listener) proc
               (ebp-client-transport-state client) listener)
         (ebp-websocket--install-advice)
         listener))))
 
 (defun ebp-websocket--close (client)
   "Registry `:close': drop every pending candidate, then the listener."
-  (when-let* ((listener (ebp-websocket--listener client)))
-    (dolist (entry (copy-sequence (ebp-websocket--listener-pending listener)))
-      (ebp-websocket--drop-pending listener entry '(listener-closed)))
-    (let ((proc (ebp-websocket--listener-process listener)))
-      (when (and proc (process-live-p proc))
-        (ignore-errors (websocket-server-close proc))))
-    (setf (ebp-client-transport-state client) nil)))
-
-(defun ebp-websocket--adopted (client candidate)
-  "Registry `:adopt': CANDIDATE became CLIENT's session; forget its entry."
-  (when-let* ((listener (ebp-websocket--listener client))
-              (entry (ebp-websocket--find-pending listener :candidate candidate)))
-    (ebp-websocket--forget listener entry)))
+  (ebp--binder-close client #'websocket-server-close))
 
 (ebp-register-transport 'loopback-websocket
                         :role 'binder
                         :check #'ebp-websocket--check
                         :listen #'ebp-websocket--listen
                         :close #'ebp-websocket--close
-                        :adopt #'ebp-websocket--adopted)
+                        :adopt #'ebp--binder-adopted)
 
-;;;; The pre-authentication pool (SPEC 5.6)
-
-(cl-defun ebp-websocket--find-pending (listener &key socket candidate)
-  "LISTENER's pending entry for SOCKET or CANDIDATE, or nil."
-  (cl-find-if (lambda (entry)
-                (or (and socket (eq (ebp-websocket--pending-socket entry) socket))
-                    (and candidate
-                         (eq (ebp-websocket--pending-candidate entry) candidate))))
-              (ebp-websocket--listener-pending listener)))
-
-(defun ebp-websocket--forget (listener entry)
-  "Remove ENTRY from LISTENER's pool and cancel its deadline."
-  (when-let* ((timer (ebp-websocket--pending-timer entry)))
-    (ignore-errors (cancel-timer timer))
-    (setf (ebp-websocket--pending-timer entry) nil))
-  (setf (ebp-websocket--listener-pending listener)
-        (delq entry (ebp-websocket--listener-pending listener))))
-
-(defun ebp-websocket--drop-pending (listener entry reason)
-  "Forget ENTRY and close what it holds: a candidate, or a bare socket."
-  (ebp-websocket--forget listener entry)
-  (let ((candidate (ebp-websocket--pending-candidate entry))
-        (socket (ebp-websocket--pending-socket entry)))
-    (cond
-     (candidate (ebp-client-close candidate reason))
-     ((and socket (process-live-p socket))
-      (if-let* ((ws (process-get socket :websocket)))
-          (ignore-errors (websocket-close ws))
-        (delete-process socket))))))
-
-(defun ebp-websocket--expire (listener entry)
-  "SPEC 5.6: ENTRY did not authenticate within the deadline."
-  (when (memq entry (ebp-websocket--listener-pending listener))
-    (ebp-websocket--drop-pending listener entry '(preauth-timeout))))
+;;;; The pre-authentication pool (SPEC 5.7, shared: `ebp--binder-*')
 
 (defun ebp-websocket--on-accept (server socket &rest _)
   "`websocket-server-accept' :after: admit SOCKET to our pool, newest wins.
@@ -316,18 +269,7 @@ upgrade is bounded as well."
               (listener (ebp-websocket--listener client)))
     (if (ebp-client-terminal-p client)
         (ignore-errors (delete-process socket))
-      (while (>= (length (ebp-websocket--listener-pending listener))
-                 (max 1 ebp-websocket-max-pending))
-        (ebp-websocket--drop-pending
-         listener (car (ebp-websocket--listener-pending listener))
-         '(preauth-evicted)))
-      (let ((entry (ebp-websocket--make-pending :socket socket
-                                                :accepted-at (float-time))))
-        (setf (ebp-websocket--pending-timer entry)
-              (run-at-time ebp-websocket--preauth-deadline nil
-                           #'ebp-websocket--expire listener entry)
-              (ebp-websocket--listener-pending listener)
-              (append (ebp-websocket--listener-pending listener) (list entry)))))))
+      (ebp--binder-admit listener socket))))
 
 ;;;; The upgrade (SPEC 5.5 Origin, SPEC 6.2 accumulation bound)
 
@@ -415,40 +357,21 @@ other server's connection passes through untouched."
 ;;;; Per-connection callbacks
 
 (defun ebp-websocket--on-open (ws)
-  "An upgrade completed: run the handshake on a fresh candidate (SPEC 5.5/5.6)."
+  "An upgrade completed: run the handshake on a fresh candidate (SPEC 5.5/5.7)."
   (let* ((server (websocket-server-conn ws))
          (client (and server (process-get server :ebp-client)))
          (listener (and client (ebp-websocket--listener client)))
          (socket (websocket-conn ws)))
     (if (or (null listener) (ebp-client-terminal-p client))
         (ignore-errors (websocket-close ws))
-      (let* ((candidate (ebp-client--make-candidate client))
-             (conn (apply #'make-instance 'ebp-websocket--connection
-                          :name "ebp-websocket" :ws ws
-                          ;; SPEC 23.3: no bodies in the clear by default.
-                          :events-buffer-config
-                          (if ebp-log-events '(:size nil :format full) '(:size 0))
-                          (ebp--connection-initargs))))
-        (setf (ebp-client-connection candidate) conn
-              (ebp-client-process candidate) socket
-              (ebp--connection-client conn) candidate
-              (websocket-client-data ws) conn)
-        (if-let* ((entry (ebp-websocket--find-pending listener :socket socket)))
-            (setf (ebp-websocket--pending-candidate entry) candidate)
-          ;; Accepted before the pool saw it (cannot happen with the
-          ;; accept advice installed); still bound it by the deadline.
-          (let ((entry (ebp-websocket--make-pending
-                        :socket socket :accepted-at (float-time)
-                        :candidate candidate)))
-            (setf (ebp-websocket--pending-timer entry)
-                  (run-at-time ebp-websocket--preauth-deadline nil
-                               #'ebp-websocket--expire listener entry))
-            (push entry (ebp-websocket--listener-pending listener))))
-        (condition-case err
-            (ebp-client-start candidate)
-          (error
-           (message "ebp-websocket: session.hello failed (%s); closing" (car err))
-           (ebp-client-close candidate (list 'hello-failed (car err)))))))))
+      (let ((conn (apply #'make-instance 'ebp-websocket--connection
+                         :name "ebp-websocket" :ws ws
+                         ;; SPEC 23.3: no bodies in the clear by default.
+                         :events-buffer-config
+                         (if ebp-log-events '(:size nil :format full) '(:size 0))
+                         (ebp--connection-initargs))))
+        (setf (websocket-client-data ws) conn)
+        (ebp--binder-start-candidate listener socket conn)))))
 
 (defun ebp-websocket--on-message (ws frame)
   "One frame from WS: reassemble, decode strictly, deliver (SPEC 5.5)."
@@ -458,7 +381,7 @@ other server's connection passes through untouched."
             (ebp--in-filter t))
         (unwind-protect
             (when-let* ((bytes (ebp-websocket--accumulate conn frame)))
-              (ebp-websocket--receive conn bytes))
+              (ebp--receive-strict conn bytes))
           (when outermost
             (when-let* ((client (ebp--connection-client conn)))
               (ebp-client--inbound-check client))))))))
@@ -470,14 +393,12 @@ other server's connection passes through untouched."
          (listener (and client (ebp-websocket--listener client)))
          (conn (websocket-client-data ws)))
     (when listener
-      (when-let* ((entry (ebp-websocket--find-pending
+      (when-let* ((entry (ebp--binder-find-pending
                           listener :socket (websocket-conn ws))))
-        (ebp-websocket--forget listener entry)))
+        (ebp--binder-forget listener entry)))
     (when conn
       (ebp-websocket--conclude conn nil)
-      (when-let* ((c (ebp--connection-client conn)))
-        (when (ebp-client-parent c)
-          (ebp-client-close c '(transport-lost)))))))
+      (ebp--binder-connection-lost conn))))
 
 (defun ebp-websocket--on-error (ws type err)
   "A callback failed: fail closed on this connection, logging no payload."
@@ -562,53 +483,6 @@ and closes."
           (setf (ebp-websocket--connection-buffered-octets conn) total)
           nil)))))))
 
-(defun ebp-websocket--reply-error (conn id code message kind)
-  "Answer a body fault on CONN with a SPEC 8 error response; ID may be nil."
-  (ignore-errors
-    (jsonrpc-connection-send conn :id id
-                             :error (list :code code :message message
-                                          :data (list :kind kind)))))
-
-(defun ebp-websocket--schedule (conn msg)
-  "Deliver MSG on CONN from a 0-delay timer whose args are (CONN MSG).
-Byte-for-byte jsonrpc.el's own delivery shape (jsonrpc.el 883-897), so
-`ebp-client--backlog' counts it and `ebp--isolate-parsed-messages'
-rewrites it; timers cannot fire inside the socket's process filter, so
-ordering matches the process transport."
-  (let ((timer (timer-create)))
-    (timer-set-time timer (current-time))
-    (timer-set-function timer
-                        (lambda (c m)
-                          (with-temp-buffer
-                            (jsonrpc-connection-receive c m)))
-                        (list conn msg))
-    (timer-activate timer)))
-
-(defun ebp-websocket--receive (conn bytes)
-  "Decode one complete message BYTES under the SPEC 4.1/6.2 receiver rules.
-A parse fault answers -32700, an invalid request -32600, both with id
-null unless the message carried a valid one, and the connection continues
-\(SPEC 6.2).  A valid message is scheduled for dispatch and then run
-through `ebp--isolate-parsed-messages' for the unknown-method sentinel."
-  (let* ((client (ebp--connection-client conn))
-         (msg (condition-case err
-                  (let ((parsed (let ((obarray (obarray-make)))
-                                  (ebp--parse-message bytes))))
-                    (ebp--remap-decoded parsed)
-                    (ebp--validate-message-plist parsed))
-                (ebp-parse-error
-                 (ebp-websocket--reply-error conn nil -32700 "Parse error"
-                                             "parse-error")
-                 nil)
-                (ebp-invalid-request
-                 (ebp-websocket--reply-error conn (nth 1 (cdr err)) -32600
-                                             "Invalid Request" "invalid-request")
-                 nil))))
-    (when msg
-      (when ebp-log-events
-        (setq msg (plist-put msg :jsonrpc-json (ebp--decode-utf-8 bytes))))
-      (ebp-websocket--schedule conn msg)
-      (when client (ebp--isolate-parsed-messages client)))))
 
 ;;;; Entry point
 
@@ -620,7 +494,7 @@ and `:allowed-origins' (REQUIRED unless `ebp-websocket-allowed-origins'
 is set).  The returned client is `closed' for `(listening)' until a
 browser Companion dials from an allowed Origin and authenticates; it
 then runs READY on that connection, survives its loss (idle again, no
-redial — the Companion redials, SPEC 5.6), and is superseded only by the
+redial — the Companion redials, SPEC 5.7), and is superseded only by the
 next connection that authenticates.  Register actions and hooks on this
 client only; the candidates that run each handshake are internal.
 `ebp-client-close' closes the listener with every connection."

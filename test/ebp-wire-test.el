@@ -392,7 +392,7 @@ Emacs leaves behind on `delete-process'."
 (cl-defun ebp-test--reconnect-script (&key on-hello on-ready)
   "A conformant script that derives each proof from the live client nonce.
 ON-HELLO receives that nonce and ON-READY runs after the barrier.  Unlike the
-fixed KAT script, this witnesses SPEC 5.6's fresh handshake on every redial."
+fixed KAT script, this witnesses SPEC 5.7's fresh handshake on every redial."
   (let (client-nonce)
     (lambda (msg send)
       (let* ((method (alist-get 'method msg))
@@ -464,7 +464,7 @@ ready — in order, with the KAT proof on the wire."
                  4194304)))))
 
 (ert-deftest ebp-test-session-superseded-stops-automatic-redial ()
-  "SPEC 5.6: an explicit supersession stands the old endpoint down."
+  "SPEC 5.7: an explicit supersession stands the old endpoint down."
   (let ((client (ebp-client-create
                  :receipt-file (make-temp-file "ebp-superseded-receipts"))))
     (setf (ebp-client-state client) 'ready)
