@@ -1472,7 +1472,8 @@ Doubles as a drain point: a paused reader resumes at the low-water mark."
     (eldoc\.show        . "editor.sync")
     (fontify\.show      . "editor.sync")
     (capability\.invoke . "capabilities")
-    (triggers\.set      . "triggers"))
+    (triggers\.set      . "triggers")
+    (surface\.data      . "data.model"))
   "Emacs-sender method → the SPEC 22.1 capability that gates it.
 Mirrors the `capability' field of the contract's method registry for
 every unconditionally gated Emacs-or-either-sender method; the wire
@@ -2749,13 +2750,17 @@ claimed, nothing sent."
 
 (cl-defun ebp-client-surface-update (client surface spec
                                      &key stale-after-s stale-spec current-view
-                                     reset-input-ids callback)
+                                     reset-input-ids data callback)
   "Push a complete snapshot for SURFACE (SPEC 13.2); returns its revision.
-SPEC is the SurfaceSpec value.  What the spec contains is the
-application's business (REWRITE-PLAN boundary); this owns the revisions."
+SPEC is the SurfaceSpec value.  DATA, when given, is the surface data
+document that rides the snapshot (SPEC 13.8.1) and is the caller's to
+gate on the `data.model' grant.  What the spec and document contain is
+the application's business (REWRITE-PLAN boundary); this owns the
+revisions."
   (ebp-client--surface-request
    client 'surface.update surface
    `(:spec ,spec
+     ,@(when data `(:data ,data))
      ,@(when stale-after-s `(:stale_after_s ,stale-after-s))
      ,@(when stale-spec `(:stale_spec ,stale-spec))
      ,@(when current-view `(:current_view ,current-view))
@@ -2771,6 +2776,20 @@ application's business (REWRITE-PLAN boundary); this owns the revisions."
    ;; and would adopt a draft this very snapshot supersedes.
    (lambda (revision)
      (ebp-client--record-reset-ids client surface revision reset-input-ids))))
+
+(cl-defun ebp-client-surface-data (client surface ops &key callback)
+  "Patch SURFACE's data document with OPS (SPEC 13.8.4); returns the revision.
+OPS is a list of DataOp plists, (:op \"set\" :path POINTER :value VALUE)
+or (:op \"remove\" :path POINTER), which the Companion applies in order
+to the document it holds for SURFACE — the whole patch or none of it.
+A patch is an ordinary revisioned mutation: it claims the next revision
+exactly as `ebp-client-surface-update' does and absorbs the result
+floor.  CALLBACK receives (STATUS ERROR) as there.  The `data.model'
+grant is checked before any revision is reserved, signaling
+`ebp-ungranted' without it (SPEC 12 rule 3)."
+  (ebp-client--check-granted client 'surface.data)
+  (ebp-client--surface-request
+   client 'surface.data surface `(:ops ,(vconcat ops)) callback))
 
 (cl-defun ebp-client-surface-remove (client surface &key callback)
   "Tombstone SURFACE at a fresh revision (SPEC 13.3); returns the revision."

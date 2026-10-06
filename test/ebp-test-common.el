@@ -56,10 +56,11 @@ SURFACES overrides the empty surfaces map."
       welcome)))
 
 (cl-defun ebp-test--kat-script (&key welcome-fn after-ready surface-fn
-                                     replay-fn)
+                                     replay-fn data-fn)
   "The default conformant companion script over the KAT pairing.
 REPLAY-FN, when given, is called with the 1-based replay call number and
-returns that call's summary plist."
+returns that call's summary plist.  DATA-FN, like SURFACE-FN, scripts the
+result of a `surface.data' request."
   (let ((replay-calls 0))
     (lambda (msg send)
       (let* ((method (alist-get 'method msg))
@@ -85,6 +86,15 @@ returns that call's summary plist."
         ("surface.update"
          (funcall reply
                   (funcall (or surface-fn
+                               (lambda (m)
+                                 `(:status "applied"
+                                   :revision ,(alist-get
+                                               'revision (alist-get 'params m))
+                                   :present t)))
+                           msg)))
+        ("surface.data"
+         (funcall reply
+                  (funcall (or data-fn
                                (lambda (m)
                                  `(:status "applied"
                                    :revision ,(alist-get

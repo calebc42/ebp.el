@@ -738,6 +738,72 @@ floors (including tombstones) and absorb applied/stale results."
                                             '(:t "text" :text "reborn"))
                  43)))))
 
+;;;; Amendment #194: the surface data document (SPEC 13.8)
+
+(ert-deftest ebp-test-client-surface-data-is-revisioned ()
+  "SPEC 13.8.4: a data patch claims a fresh revision like any mutation,
+carries only its ops, and absorbs applied and stale results (13.2)."
+  (let ((ready nil) (statuses '()))
+    (ebp-test--with-companion
+        (server client
+                (ebp-test--kat-script
+                 :welcome-fn
+                 (lambda (w)
+                   (plist-put w :granted ["theme" "data.model"])
+                   (plist-put w :surfaces '(:app:main (:revision 41 :present t))))
+                 :data-fn
+                 (lambda (m)
+                   (let ((rev (alist-get 'revision (alist-get 'params m))))
+                     (if (= rev 43)
+                         '(:status "stale" :revision 50 :present t)
+                       `(:status "applied" :revision ,rev :present t)))))
+                :ready-function (lambda (_c) (setq ready t)))
+      (should (ebp-test--wait (lambda () ready)))
+      (let ((record (lambda (status _err) (push status statuses))))
+        ;; The snapshot carries its document.
+        (should (= (ebp-client-surface-update
+                    client "app:main" '(:t "text" :bind (:text "/title"))
+                    :data '(:title "hi") :callback record)
+                   42))
+        ;; A patch is the next revision and carries only its ops.
+        (should (= (ebp-client-surface-data
+                    client "app:main"
+                    '((:op "set" :path "/title" :value "again")
+                      (:op "remove" :path "/draft"))
+                    :callback record)
+                   43))
+        (should (ebp-test--wait (lambda () (= (length statuses) 2))))
+        (should (equal (sort (copy-sequence statuses) #'string<)
+                       '("applied" "stale")))
+        (let* ((received (funcall (plist-get server :received)))
+               (update (cl-find-if
+                        (lambda (m) (equal (alist-get 'method m) "surface.update"))
+                        received))
+               (patch (cl-find-if
+                       (lambda (m) (equal (alist-get 'method m) "surface.data"))
+                       received))
+               (params (alist-get 'params patch)))
+          (should (equal (alist-get 'title (alist-get 'data (alist-get 'params update)))
+                         "hi"))
+          (should (= (alist-get 'revision params) 43))
+          (should-not (assq 'spec params))
+          (should (equal (mapcar (lambda (op) (alist-get 'op op))
+                                 (append (alist-get 'ops params) nil))
+                         '("set" "remove"))))
+        ;; The stale result absorbed the Companion's floor (SPEC 13.2).
+        (should (= (ebp-client-surface-data
+                    client "app:main" '((:op "set" :path "/title" :value "newest")))
+                   51))))))
+
+(ert-deftest ebp-test-client-surface-data-requires-the-grant ()
+  "SPEC 12 rule 3 / 13.8.3: without `data.model' a patch is refused before
+any revision is reserved or any frame is built."
+  (let ((client (ebp-client-create
+                 :receipt-file (make-temp-file "ebp-data-gate"))))
+    (should-error (ebp-client-surface-data
+                   client "app:main" '((:op "set" :path "/a" :value 1)))
+                  :type 'ebp-ungranted)))
+
 ;;;; W5: the event.action server and state.changed (SPEC 14)
 
 (defun ebp-test--event-params (event-id &optional action)
