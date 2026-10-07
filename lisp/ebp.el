@@ -756,6 +756,12 @@ them.")
   ;; mirror and every window.changed since.
   window
   window-changed-functions ; called with (client window-plist)
+  ;; SPEC 20.1.2 (#197): the last-reported locale advice plist
+  ;; (:tag :hour_cycle :time_zone), from the welcome mirror and every
+  ;; locale.changed since; nil while unknown, when Emacs falls back to
+  ;; its own locale.
+  locale
+  locale-changed-functions ; called with (client locale-plist)
   ;; SPEC 19: Emacs's mirror of synchronized editors, (doc . id) ->
   ;; plist (:session :seq :text :cursor).  Emacs chars ARE Unicode
   ;; scalar values, so splice positions are char positions directly.
@@ -856,6 +862,8 @@ Receipts are partitioned by :pairing-id (SPEC 14.4)."
                                  #'ebp-client--handle-state-changed)
     (ebp-client-register-handler client "window.changed"
                                  #'ebp-client--handle-window-changed)
+    (ebp-client-register-handler client "locale.changed"
+                                 #'ebp-client--handle-locale-changed)
     (when-let* ((fn (plist-get config :edit-change-function)))
       (push fn (ebp-client-edit-change-functions client)))
     (when-let* ((fn (plist-get config :edit-splice-function)))
@@ -947,6 +955,7 @@ session identities do not."
         (ebp-client-input-state client) nil
         (ebp-client-device client) nil
         (ebp-client-window client) nil
+        (ebp-client-locale client) nil
         (ebp-client-replay-summary client) nil
         (ebp-client-outstanding client) 0
         (ebp-client-outstanding-held client) nil
@@ -1089,6 +1098,7 @@ bypasses the pure machine; the candidate reached `syncing' through
               (ebp-client-input-state parent) (ebp-client-input-state client)
               (ebp-client-device parent) (ebp-client-device client)
               (ebp-client-window parent) (ebp-client-window client)
+              (ebp-client-locale parent) (ebp-client-locale client)
               (ebp-client-outstanding parent) (ebp-client-outstanding client)
               (ebp-client-outstanding-held parent) (ebp-client-outstanding-held client)
               (ebp-client-inbound-paused parent) (ebp-client-inbound-paused client)
@@ -1769,7 +1779,10 @@ synchronization barrier (SPEC 10.3)."
           (ebp-client-device client) (plist-get result :device)
           ;; SPEC 20.1.1: the welcome's window mirror, so the FIRST
           ;; snapshot can be authored for the right size class.
-          (ebp-client-window client) (plist-get result :window))
+          (ebp-client-window client) (plist-get result :window)
+          ;; SPEC 20.1.2: the welcome's locale mirror — presentation
+          ;; advice for the device's clock cycle and civil day.
+          (ebp-client-locale client) (plist-get result :locale))
     ;; Reported floors cover snapshots AND tombstones (SPEC 10.2/13.3).
     ;; Each is absorbed — persisted, and only ever rising — rather than
     ;; installed verbatim: a floor this endpoint persisted in a previous
@@ -2218,6 +2231,16 @@ Stores the geometry plist and runs `window-changed-functions' — the
 application's seam for re-authoring layout for the new size class."
   (setf (ebp-client-window client) params)
   (dolist (fn (ebp-client-window-changed-functions client))
+    (funcall fn client params)))
+
+(defun ebp-client--handle-locale-changed (client params)
+  "The `locale.changed' receiver (SPEC 20.1.2).
+Stores the locale plist (:tag :hour_cycle :time_zone) and runs
+`locale-changed-functions' — the application's seam for re-authoring
+clocks and civil days for the device.  Presentation advice, never an
+event: nothing here dispatches, persists, or acknowledges."
+  (setf (ebp-client-locale client) params)
+  (dolist (fn (ebp-client-locale-changed-functions client))
     (funcall fn client params)))
 
 (defun ebp-client-input-caret (client surface id)

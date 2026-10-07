@@ -1279,6 +1279,24 @@ reset at a higher revision supersedes; a later report reinstates."
       (should (equal (ebp-client-input-value client "app:main" "title")
                      "reinstated")))))
 
+(ert-deftest ebp-test-locale-changed-is-stored-and-fanned-out ()
+  "SPEC 20.1.2 (#197): the receiver stores the locale advice and runs
+`locale-changed-functions'; nothing is dispatched or persisted, and the
+welcome mirror lands through the same slot."
+  (let* ((client (ebp-test--store-client))
+         (seen nil)
+         (advice '(:tag "de-DE" :hour_cycle "h23" :time_zone "Europe/Berlin")))
+    (push (lambda (c plist) (push (cons c plist) seen))
+          (ebp-client-locale-changed-functions client))
+    (should (null (ebp-client-locale client)))
+    (ebp-client--handle-locale-changed client advice)
+    (should (equal (ebp-client-locale client) advice))
+    (should (equal seen (list (cons client advice))))
+    (ebp-client--handle-locale-changed
+     client '(:tag "en-US" :hour_cycle "h12" :time_zone "America/Denver"))
+    (should (equal (plist-get (ebp-client-locale client) :hour_cycle) "h12"))
+    (should (equal (length seen) 2))))
+
 (ert-deftest ebp-test-reset-history-precedes-the-send ()
   "A8/H1: a send is NOT atomic with respect to our own state.
 `process-send-string' on a frame large enough to fill the socket buffer
