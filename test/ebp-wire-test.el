@@ -14,6 +14,7 @@
 
 (require 'ert)
 (require 'ebp)
+(require 'ebp-sqlite) ; these tests inspect the default backend
 (require 'ebp-test-common)
 
 (defconst ebp-test--root
@@ -3054,6 +3055,67 @@ that GnuTLS's `:public-key-id-sha256' is the SPKI SHA-256 the spec names."
               (ignore-errors (ebp-client-close client 'test-done)))))
       (ignore-errors (delete-process server))
       (ignore-errors (kill-buffer buf))
+      (delete-directory dir t))))
+
+;;;; The store seam: the core names no backend
+
+(cl-defstruct ebp-test-fake-store
+  "A SPEC 14.4 store that implements only the `ebp-store' contract."
+  file partition (known nil) (closed nil))
+
+(cl-defmethod ebp-store-known-p ((store ebp-test-fake-store) pairing-id event-id)
+  (and (member (cons pairing-id event-id) (ebp-test-fake-store-known store)) t))
+
+(cl-defmethod ebp-store-admit-completed
+  ((store ebp-test-fake-store) pairing-id event-id _now-ms)
+  (if (ebp-store-known-p store pairing-id event-id)
+      'duplicate
+    (push (cons pairing-id event-id) (ebp-test-fake-store-known store))
+    'admitted))
+
+(cl-defmethod ebp-store-surface-floors ((_store ebp-test-fake-store) _pairing-id)
+  nil)
+
+(cl-defmethod ebp-store-prune ((_store ebp-test-fake-store) _now-ms _retention-ms)
+  0)
+
+(cl-defmethod ebp-store-close ((store ebp-test-fake-store))
+  (setf (ebp-test-fake-store-closed store) t))
+
+(ert-deftest ebp-test-store-is-reached-only-through-the-contract ()
+  "`ebp-store-open-function' is the one seam between the core and a backend.
+A store object that implements nothing but the `ebp-store' generics is
+opened with the resolved path and the partition, carries a full
+`event.action' round trip including the SPEC 14.4 duplicate answer, and
+is closed with the client — so `ebp.el' never needs `ebp-sqlite'."
+  (let* ((dir (make-temp-file "ebp-fake-store" t))
+         (file (expand-file-name "receipts" dir))
+         (opened nil)
+         (ebp-store-open-function
+          (lambda (path partition)
+            (setq opened (list path partition))
+            (make-ebp-test-fake-store :file path :partition partition)))
+         (runs 0)
+         (client (ebp-test--store-client :receipt-file file
+                                         :pairing-id ebp-test--kat-pid))
+         (store (ebp-client-store client)))
+    (unwind-protect
+        (progn
+          (should (ebp-test-fake-store-p store))
+          (should (equal opened (list file (ebp-client--partition client))))
+          (ebp-client-register-action
+           client "demo.count" (lambda (_c _p) (cl-incf runs) 'accepted))
+          (let ((params (ebp-test--event-params (make-string 32 ?a))))
+            (should (equal "accepted"
+                           (plist-get (ebp-client--handle-event-action client params)
+                                      :status)))
+            (should (equal "duplicate"
+                           (plist-get (ebp-client--handle-event-action client params)
+                                      :status)))
+            (should (= runs 1)))
+          (ebp-client-close client 'test-done)
+          (should (ebp-test-fake-store-closed store)))
+      (ignore-errors (ebp-client-close client 'test-done))
       (delete-directory dir t))))
 
 (provide 'ebp-wire-test)

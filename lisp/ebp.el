@@ -13,9 +13,12 @@
 ;; machine and reconnect lifecycle (SPEC 5.7, 10.1).  Transport wiring is
 ;; generic EBP endpoint behavior; no Jetpacs application policy lives here.
 ;;
-;; Durable SPEC 14.4 EventId receipts are delegated to `ebp-store.el' and
-;; its `ebp-sqlite.el' backend; what this file owns is only the SPEC 14.4
-;; dispatch ordering around them.
+;; Durable SPEC 14.4 EventId receipts are delegated to the `ebp-store.el'
+;; contract.  This file reaches a store only through that contract's
+;; generics and opens one only through `ebp-store-open-function', so no
+;; backend is a load-time dependency; `ebp-sqlite.el' is merely the
+;; default plugged into that option.  What this file owns is only the
+;; SPEC 14.4 dispatch ordering around the store.
 ;;
 ;; Every function cites the section it implements.  Behavior with no
 ;; section is a bug in this file or an amendment owed to the EBP spec.
@@ -26,7 +29,6 @@
 (require 'jsonrpc)
 (require 'gnutls)
 (require 'ebp-store)
-(require 'ebp-sqlite)
 
 ;; A C primitive that exists only in a GnuTLS-enabled build, declared so a
 ;; build without one still byte-compiles this file clean.  Its only caller,
@@ -55,14 +57,30 @@ the directory on first use when it is missing."
 (defcustom ebp-receipt-file "ebp-receipts"
   "Durable store for accepted EventId receipts (SPEC 14.4).
 A relative name is resolved against `ebp-directory'; an absolute path
-is used as given.  The file is a SQLite database opened through
-`ebp-sqlite-open' and partitioned by pairing identity, so one file
-serves several pairings and SPEC 14.4's EventId uniqueness stays scoped
-to each.  Without built-in SQLite, or when the file cannot be opened or
-migrated, no store exists and every `event.action' answers 1500
-event-retry before any handler runs.  A connection's :receipt-file
-config overrides it and resolves the same way."
+is used as given.  The file is opened through `ebp-store-open-function'
+and partitioned by pairing identity, so one file serves several pairings
+and SPEC 14.4's EventId uniqueness stays scoped to each.  When the
+backend is unavailable, or the file cannot be opened or migrated, no
+store exists and every `event.action' answers 1500 event-retry before
+any handler runs.  A connection's :receipt-file config overrides it and
+resolves the same way."
   :type 'file)
+
+(defcustom ebp-store-open-function #'ebp-sqlite-open
+  "Function that opens the durable SPEC 14.4 store behind `ebp-receipt-file'.
+Called as (FILE PAIRING-ID) with the resolved path and the pairing
+identity whose partition the client will use; it returns an object that
+implements every `ebp-store' generic (`ebp-store-known-p',
+`ebp-store-admit-completed', `ebp-store-surface-floors', ...), or
+signals an error, which the client reports and treats as \"no store\".
+This is the only seam through which the core names a backend: the
+default is the SQLite implementation in `ebp-sqlite.el', loaded on
+first use; an application or a test substitutes its own store here."
+  :type 'function)
+
+;; The default backend loads on first call, so `ebp-sqlite.el' is not a
+;; load-time dependency of the core.
+(autoload 'ebp-sqlite-open "ebp-sqlite")
 
 (defun ebp--data-file (name)
   "Absolute path for persisted file NAME under `ebp-directory'.
@@ -744,7 +762,7 @@ them.")
   (revisions (make-hash-table :test #'equal))
   ;; SPEC 14: the action allowlist and the durable EventId receipts.
   (actions (make-hash-table :test #'equal))
-  store          ; nil or an `ebp-sqlite-store' (see `ebp-receipt-file')
+  store          ; nil or an `ebp-store' object from `ebp-store-open-function'
   ;; SPEC 14.6: latest input values by (surface . id), and this side's
   ;; reset history for the P1 #2 reconciliation rule.
   (input-values (make-hash-table :test #'equal))
@@ -1188,7 +1206,7 @@ reference alone would leave the secret live in the caller's structure."
     ;; erased rather than left behind under a name nothing owns.
     (when (and (not ok) (stringp file) (file-exists-p file))
       (condition-case err
-          (let ((store (ebp-sqlite-open file partition)))
+          (let ((store (funcall ebp-store-open-function file partition)))
             (unwind-protect
                 (progn (ebp-store-forget-pairing store partition)
                        (setq ok t))
@@ -2068,10 +2086,11 @@ event-retry before any handler runs.  The diagnostic names the path so an
 operator can act on it — a pre-SQLite text receipt file, for instance, is
 not migrated and must be removed by hand.
 
-The store's parent directory is created when missing.  `ebp-sqlite-open'
-refuses a missing directory on purpose — the store module never decides
-where files go — so the client, which owns the configured path, makes
-the directory before handing the path down.  A directory that cannot be
+The store's parent directory is created when missing.  A backend
+\(`ebp-sqlite-open', the default `ebp-store-open-function') refuses a
+missing directory on purpose — the store module never decides where
+files go — so the client, which owns the configured path, makes the
+directory before handing the path down.  A directory that cannot be
 created is one more way the store is unavailable."
   (when-let* ((file (plist-get (ebp-client-config client) :receipt-file)))
     (let ((store
@@ -2080,7 +2099,8 @@ created is one more way the store is unavailable."
                  (when-let* ((directory (file-name-directory
                                          (expand-file-name file))))
                    (make-directory directory t))
-                 (ebp-sqlite-open file (ebp-client--partition client)))
+                 (funcall ebp-store-open-function
+                          file (ebp-client--partition client)))
              (error
               (message "ebp: durable receipt store %s unavailable (%s); \
 event.action answers 1500 event-retry"

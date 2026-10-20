@@ -20,6 +20,7 @@
 (require 'ert)
 (require 'sqlite)
 (require 'ebp)
+(require 'ebp-sqlite) ; these tests inspect the default backend
 
 (defconst ebp-revision-test-pair (make-string 32 ?c))
 (defconst ebp-revision-test-event "00000000000000000000000000000011")
