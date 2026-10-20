@@ -30,16 +30,8 @@
 
 (require 'cl-lib)
 (require 'jsonrpc)
-(require 'gnutls)
 (require 'ebp-wire)
 (require 'ebp-store)
-
-;; A C primitive that exists only in a GnuTLS-enabled build, declared so a
-;; build without one still byte-compiles this file clean.  Its only caller,
-;; `ebp--open-tls-socket', runs after `ebp--check-transport-config' has
-;; confirmed `gnutls-available-p' — which every build defines, returning
-;; nil without GnuTLS, so it needs no declaration or `fboundp' guard.
-(declare-function gnutls-peer-status "gnutls.c" (proc))
 
 ;;;; User options (custom.el: declared defaults, overridable from init.el
 ;;;; with `setopt' without touching code; per-connection config plists
@@ -104,14 +96,14 @@ A connection's :replay-retry-delay config overrides it."
 
 (defcustom ebp-auto-reconnect t
   "Whether an unexpected transport loss schedules a fresh EBP handshake.
-Under every transport profile this endpoint implements (SPEC 5.2-5.4)
+Under every dialer transport profile (SPEC 5.2-5.4)
 Emacs is the dialer, so Emacs alone can re-establish a transport the
 Companion's platform tore down — an Android process kill, a desktop
 Companion restart, a phone that left the network.  The default keeps one
 logical endpoint alive across those.  Redials use the jittered bounded
 backoff SPEC 5.7 requires of the dialing endpoint.  An explicit
-`session.superseded' notification, a refused transport (a `network-tls'
-certificate mismatch, a Unix socket owned by another user), and
+`session.superseded' notification, a refused transport (a Unix socket
+owned by another user, a certificate pin mismatch under `ebp-tls'), and
 `ebp-client-close' all stop automatic redial.  A connection's
 :auto-reconnect config overrides this option."
   :type 'boolean)
@@ -727,11 +719,14 @@ reference alone would leave the secret live in the caller's structure."
       (when (stringp token) (ignore-errors (clear-string token))))
     (setf (ebp-client-config client)
           (plist-put (ebp-client-config client) :token nil))
-    ;; SPEC 5.4: revocation destroys the recorded certificate digest too.
-    (when (plist-member (ebp-client-config client) :certificate-fingerprint)
-      (setf (ebp-client-config client)
-            (plist-put (ebp-client-config client)
-                       :certificate-fingerprint nil)))
+    ;; Revocation destroys whatever else the transport profile recorded
+    ;; as pairing material (SPEC 5.4's certificate digest, for one): the
+    ;; profile names those config keys as its `:secrets'.
+    (dolist (key (plist-get (ebp--transport (ebp-client--transport client))
+                            :secrets))
+      (when (plist-member (ebp-client-config client) key)
+        (setf (ebp-client-config client)
+              (plist-put (ebp-client-config client) key nil))))
     ok))
 
 (defun ebp-client--step (client event)
@@ -2884,7 +2879,7 @@ outermost exit, as for the dialer's filter wrapper."
       (ebp--strict-conclude conn nil)
       (ebp--binder-connection-lost conn))))
 
-;;;; Transports (SPEC 5.2-5.4): jsonrpc-process-connection, unmodified
+;;;; Transports (SPEC 5.2-5.3) and the profile registry: jsonrpc-process-connection, unmodified
 
 ;; Every profile this endpoint is REQUIRED to implement has Emacs as the
 ;; dialer, which is why one reconnect lifecycle (SPEC 5.7) serves all of
@@ -2907,11 +2902,16 @@ outermost exit, as for the dialer's filter wrapper."
 
 (defvar ebp--transport-registry nil
   "Alist of SPEC 5 transport profile SYMBOL -> property plist.
-Properties: `:role' (`dialer' or `binder'), and for a module-provided
-profile `:check' (HOST PORT CONFIG), `:listen' (CLIENT, idempotent),
-`:close' (CLIENT), `:adopt' (CLIENT CANDIDATE).  The three built-in
-dialer profiles register with a role only; their sockets are opened by
-`ebp-client--open-dialer-transport' directly.")
+Properties: `:role' (`dialer' or `binder'); `:check' (HOST PORT CONFIG),
+run by `ebp-connect' before any client exists and expected to signal
+`error' on a misconfiguration; `:secrets', the config keys the profile
+treats as pairing material, erased by `ebp-client-forget-pairing'.
+A dialer also provides `:open' (CLIENT), which returns the connected
+process or signals (`ebp-transport-refused' for a terminal refusal).
+A binder provides `:listen' (CLIENT, idempotent), `:close' (CLIENT), and
+`:adopt' (CLIENT CANDIDATE).  The two mandatory loopback dialers (SPEC
+5.2, 5.3) register below; `network-tls' (SPEC 5.4) is `ebp-tls', the
+binder profiles are `ebp-websocket' and `ebp-unix'.")
 
 (defvar ebp-transports nil
   "The SPEC 5 transport profile symbols currently registered, newest first.")
@@ -2928,48 +2928,24 @@ replaces the earlier entry."
   "The registry plist for transport profile SYMBOL, or nil."
   (alist-get symbol ebp--transport-registry))
 
-(dolist (profile '(loopback-tcp loopback-unix network-tls))
-  (ebp-register-transport profile :role 'dialer))
-
 (defun ebp-client--transport (client)
   "CLIENT's transport profile symbol; `loopback-tcp' when unconfigured."
   (or (plist-get (ebp-client-config client) :transport) 'loopback-tcp))
-
-(defun ebp--normalize-fingerprint (value)
-  "VALUE as 64 lowercase hex characters, or nil when it is not a digest.
-Accepts the SPEC 5.4 display form (bare hex, any case) and GnuTLS's
-\"sha256:aa:bb:...\" rendering, which is how `gnutls-peer-status' reports
-the same digest.  Never signals."
-  (when (stringp value)
-    (let* ((bare (if (string-prefix-p "sha256:" value)
-                     (substring value (length "sha256:"))
-                   value))
-           (hex (downcase (replace-regexp-in-string ":" "" bare t t))))
-      (and (string-match-p "\\`[0-9a-f]\\{64\\}\\'" hex) hex))))
 
 (defun ebp--check-transport-config (transport host port config)
   "Signal `error' unless TRANSPORT, HOST, PORT, and CONFIG make sense together.
 Runs BEFORE any client, store, or socket exists, so a misconfiguration is
 a synchronous caller error rather than a client stuck redialing — and so
-an unpinned `network-tls' dial, exactly the unverified connection SPEC
-5.4 forbids, can never be attempted."
+a profile's `:check' can veto a dial it must never attempt (an unpinned
+`network-tls' dial, SPEC 5.4).  An unregistered profile that a sibling
+module provides is named with the feature to require."
   (unless (ebp--transport transport)
     (error "ebp: unknown :transport %S (registered: %S%s)" transport ebp-transports
-           (if (eq transport 'loopback-websocket)
-               "; SPEC 5.5 needs (require 'ebp-websocket)" "")))
-  (pcase transport
-    ('loopback-unix
-     (unless (and (stringp host) (not (string-empty-p host)))
-       (error "ebp: loopback-unix takes the socket path as HOST, got %S" host))
-     (when port
-       (error "ebp: loopback-unix takes no PORT, got %S" port)))
-    ('network-tls
-     (unless (gnutls-available-p)
-       (error "ebp: network-tls needs an Emacs built with GnuTLS"))
-     (unless (ebp--normalize-fingerprint
-              (plist-get config :certificate-fingerprint))
-       (error "ebp: network-tls needs :certificate-fingerprint, the 64-hex \
-SHA-256 of the Companion's SubjectPublicKeyInfo shown at pairing (SPEC 5.4)"))))
+           (pcase transport
+             ('network-tls "; SPEC 5.4 needs (require 'ebp-tls)")
+             ('loopback-websocket "; SPEC 5.5 needs (require 'ebp-websocket)")
+             ('emacs-unix "; SPEC 5.6 needs (require 'ebp-unix)")
+             (_ ""))))
   (when-let* ((check (plist-get (ebp--transport transport) :check)))
     (funcall check host port config)))
 
@@ -3013,60 +2989,44 @@ which the caller retries with backoff like a refused TCP connect."
     (make-network-process :name "ebp" :family 'local :service path
                           :noquery t :coding 'utf-8-unix)))
 
-(defun ebp--open-tls-socket (host port fingerprint)
-  "SPEC 5.4: dial HOST:PORT inside TLS and pin the Companion's public key.
-A blocking `make-network-process' completes the TLS handshake before it
-returns, so the peer certificate is known here, before any frame exists.
-Certificate-authority and hostname checks are deliberately off
-\(:verify-error nil): the pin IS the verification, and a self-signed
-per-pairing certificate could pass no other.  The digest GnuTLS reports
-as `:public-key-id-sha256' is the SHA-256 of the DER-encoded
-SubjectPublicKeyInfo — the bytes `openssl x509 -pubkey' hashes and the
-bytes a JVM's `PublicKey.getEncoded' yields — so both ends compute the
-same 64 hex characters from the same certificate.  On a mismatch, or a
-negotiated protocol below TLS 1.3, the socket is closed with nothing
-written and `ebp-transport-refused' is signaled — terminal for redial.
-FINGERPRINT is already normalized by `ebp--normalize-fingerprint'.
+;; Pin the coding system of every dialer socket: jsonrpc.el 1.0.25 never
+;; sets one, so an ambient `coding-system-for-read' (or `undecided'
+;; auto-detection picking a non-UTF-8 charset, or DOS eol conversion
+;; mangling the \r\n header terminator) would corrupt framing.
+;;
+;; It MUST be utf-8-unix, NOT binary, even though Content-Length counts
+;; octets: jsonrpc.el's process buffer is MULTIBYTE and
+;; `jsonrpc--process-filter' sizes the body with `position-bytes'.  Under
+;; binary the filter inserts a unibyte string, every octet >= 0x80 becomes
+;; a raw-byte char of 2 internal bytes, `position-bytes' over-counts, and
+;; the body is truncated — the frame is then silently dropped as invalid
+;; JSON.  Verified on 30.1: a framed body carrying "café" dispatches under
+;; utf-8-unix and vanishes under binary.  `ebp--open-unix-socket' and
+;; `ebp-tls--open-socket' pin the same coding system.
+(defun ebp--open-loopback-tcp (client)
+  "SPEC 5.2: dial CLIENT's host and port over plain loopback TCP."
+  (make-network-process
+   :name "ebp" :host (ebp-client-host client) :service (ebp-client-port client)
+   :noquery t :coding 'utf-8-unix))
 
-`gnutls-verify-error' is bound to nil for the parameter build because
-`gnutls-boot-parameters' treats an explicit :verify-error nil as \"fall
-back to the user option\": under a hardened init.el (`gnutls-verify-error'
-t) the self-signed certificate would fail CA validation inside the C
-handshake, the dial would signal a plain `error', and `ebp-connect' would
-redial forever as `transport-unavailable' instead of ever reaching the pin."
-  (let ((proc (make-network-process
-               :name "ebp" :host host :service port :noquery t
-               :coding 'utf-8-unix
-               :tls-parameters
-               (cons 'gnutls-x509pki
-                     (let ((gnutls-verify-error nil))
-                       (gnutls-boot-parameters
-                        :type 'gnutls-x509pki :hostname host
-                        :verify-error nil :complete-negotiation t))))))
-    (condition-case err
-        (let* ((status (and (process-live-p proc) (gnutls-peer-status proc)))
-               (protocol (plist-get status :protocol))
-               (peer (ebp--normalize-fingerprint
-                      (plist-get (plist-get status :certificate)
-                                 :public-key-id-sha256))))
-          (unless status
-            (error "TLS handshake did not complete"))
-          (unless (and (stringp protocol)
-                       (string-match "\\`TLS\\([0-9]+\\)\\.\\([0-9]+\\)\\'" protocol)
-                       (or (> (string-to-number (match-string 1 protocol)) 1)
-                           (>= (string-to-number (match-string 2 protocol)) 3)))
-            (signal 'ebp-transport-refused
-                    (list 'tls-version-too-low host port protocol)))
-          (unless (and peer (string= peer fingerprint))
-            (signal 'ebp-transport-refused
-                    (list 'certificate-mismatch host port peer)))
-          proc)
-      (error
-       (ignore-errors (delete-process proc))
-       (signal (car err) (cdr err))))))
+(defun ebp--check-loopback-unix (host port _config)
+  "SPEC 5.3: HOST is the socket path and there is no PORT."
+  (unless (and (stringp host) (not (string-empty-p host)))
+    (error "ebp: loopback-unix takes the socket path as HOST, got %S" host))
+  (when port
+    (error "ebp: loopback-unix takes no PORT, got %S" port)))
+
+(ebp-register-transport 'loopback-tcp
+                        :role 'dialer
+                        :open #'ebp--open-loopback-tcp)
+(ebp-register-transport 'loopback-unix
+                        :role 'dialer
+                        :check #'ebp--check-loopback-unix
+                        :open (lambda (client)
+                                (ebp--open-unix-socket (ebp-client-host client))))
 
 (defun ebp-client--open-transport (client)
-  "Open CLIENT's configured transport (SPEC 5.2-5.5).
+  "Open CLIENT's configured transport (SPEC 5.2-5.6).
 A dialer profile opens its socket and starts a fresh handshake at once.
 A binder profile ensures its listener is bound and returns with CLIENT
 `closed' for `(listening)': the handshake runs per accepted connection,
@@ -3082,37 +3042,13 @@ CLIENT."
       (ebp-client--open-dialer-transport client))))
 
 (defun ebp-client--open-dialer-transport (client)
-  "Open CLIENT's dialer transport (SPEC 5.2-5.4) and start a fresh handshake."
-  (let* ((host (ebp-client-host client))
-         (port (ebp-client-port client))
-         (transport (ebp-client--transport client))
-         ;; Pin the coding system: jsonrpc.el 1.0.25 never sets one, so an
-         ;; ambient `coding-system-for-read' (or `undecided' auto-detection
-         ;; picking a non-UTF-8 charset, or DOS eol conversion mangling the
-         ;; \r\n header terminator) would corrupt framing.
-         ;;
-         ;; It MUST be utf-8-unix, NOT binary, even though Content-Length
-         ;; counts octets: jsonrpc.el's process buffer is MULTIBYTE and
-         ;; `jsonrpc--process-filter' sizes the body with `position-bytes'.
-         ;; Under binary the filter inserts a unibyte string, every octet
-         ;; >= 0x80 becomes a raw-byte char of 2 internal bytes,
-         ;; `position-bytes' over-counts, and the body is truncated — the
-         ;; frame is then silently dropped as invalid JSON.  Verified on
-         ;; 30.1: a framed body carrying "café" dispatches under
-         ;; utf-8-unix and vanishes under binary.
-         (proc (pcase transport
-                 ('loopback-tcp
-                  (make-network-process
-                   :name "ebp" :host host :service port :noquery t
-                   :coding 'utf-8-unix))
-                 ('loopback-unix (ebp--open-unix-socket host))
-                 ('network-tls
-                  (ebp--open-tls-socket
-                   host port
-                   (ebp--normalize-fingerprint
-                    (plist-get (ebp-client-config client)
-                               :certificate-fingerprint))))
-                 (_ (error "ebp: unknown :transport %S" transport))))
+  "Open CLIENT's dialer transport through its profile's `:open' and start
+a fresh handshake (SPEC 5.2-5.4)."
+  (let* ((transport (ebp-client--transport client))
+         (open (plist-get (ebp--transport transport) :open))
+         (proc (if open
+                   (funcall open client)
+                 (error "ebp: :transport %S has no :open" transport)))
          (conn (apply #'make-instance
                       'ebp--connection
                       :name "ebp" :process proc
@@ -3172,12 +3108,14 @@ active and schedules fresh handshakes with jittered bounded backoff
      Companion's loopback listener, conventionally 127.0.0.1:8765.
   `loopback-unix' (SPEC 5.3): HOST is the Companion's socket path and
      PORT must be nil.  A socket file owned by another user is refused.
-  `network-tls' (SPEC 5.4): HOST:PORT inside TLS 1.3 or later,
-     conventionally port 8766.  :certificate-fingerprint is REQUIRED —
-     the 64-hex SHA-256 of the Companion's SubjectPublicKeyInfo shown at
-     pairing; GnuTLS's \"sha256:aa:bb:...\" spelling is accepted too.  The
-     pin is verified before `session.hello' is sent; a mismatch closes
-     the transport with nothing written.
+
+`network-tls' (SPEC 5.4) is a DIALER profile provided by the optional
+`ebp-tls' feature: HOST:PORT inside TLS 1.3 or later, conventionally port
+8766.  :certificate-fingerprint is REQUIRED — the 64-hex SHA-256 of the
+Companion's SubjectPublicKeyInfo shown at pairing; GnuTLS's
+\"sha256:aa:bb:...\" spelling is accepted too.  The pin is verified before
+`session.hello' is sent; a mismatch closes the transport with nothing
+written.
 
 `loopback-websocket' (SPEC 5.5) is a BINDER profile provided by the
 optional `ebp-websocket' feature: HOST must be 127.0.0.1, PORT is the

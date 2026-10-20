@@ -10,7 +10,8 @@ framing, the JSON-RPC envelope, pairing proofs, and the session state step.
 protocol dispatch, revisions, receipts, transports, and module plumbing.  The
 other `ebp-*.el` files are reusable endpoint modules for synchronization,
 completion, sandboxed paths, durable receipt/work storage, and the optional
-transport profiles.  None may depend on Jetpacs or another application.
+transport profiles (`ebp-tls.el`, `ebp-websocket.el`, `ebp-unix.el`).  None
+may depend on Jetpacs or another application.
 
 Run the standalone gate with:
 
