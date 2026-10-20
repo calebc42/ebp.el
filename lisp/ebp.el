@@ -28,10 +28,12 @@
 (require 'ebp-store)
 (require 'ebp-sqlite)
 
-;; C primitives present only in a GnuTLS-enabled build; declared so a
-;; build without one still byte-compiles this file clean.
+;; A C primitive that exists only in a GnuTLS-enabled build, declared so a
+;; build without one still byte-compiles this file clean.  Its only caller,
+;; `ebp--open-tls-socket', runs after `ebp--check-transport-config' has
+;; confirmed `gnutls-available-p' — which every build defines, returning
+;; nil without GnuTLS, so it needs no declaration or `fboundp' guard.
 (declare-function gnutls-peer-status "gnutls.c" (proc))
-(declare-function gnutls-available-p "gnutls.c" ())
 
 ;;;; User options (custom.el: declared defaults, overridable from init.el
 ;;;; with `setopt' without touching code; per-connection config plists
@@ -3454,7 +3456,7 @@ an unpinned `network-tls' dial, exactly the unverified connection SPEC
      (when port
        (error "ebp: loopback-unix takes no PORT, got %S" port)))
     ('network-tls
-     (unless (and (fboundp 'gnutls-available-p) (gnutls-available-p))
+     (unless (gnutls-available-p)
        (error "ebp: network-tls needs an Emacs built with GnuTLS"))
      (unless (ebp--normalize-fingerprint
               (plist-get config :certificate-fingerprint))
@@ -3516,15 +3518,23 @@ bytes a JVM's `PublicKey.getEncoded' yields — so both ends compute the
 same 64 hex characters from the same certificate.  On a mismatch, or a
 negotiated protocol below TLS 1.3, the socket is closed with nothing
 written and `ebp-transport-refused' is signaled — terminal for redial.
-FINGERPRINT is already normalized by `ebp--normalize-fingerprint'."
+FINGERPRINT is already normalized by `ebp--normalize-fingerprint'.
+
+`gnutls-verify-error' is bound to nil for the parameter build because
+`gnutls-boot-parameters' treats an explicit :verify-error nil as \"fall
+back to the user option\": under a hardened init.el (`gnutls-verify-error'
+t) the self-signed certificate would fail CA validation inside the C
+handshake, the dial would signal a plain `error', and `ebp-connect' would
+redial forever as `transport-unavailable' instead of ever reaching the pin."
   (let ((proc (make-network-process
                :name "ebp" :host host :service port :noquery t
                :coding 'utf-8-unix
                :tls-parameters
                (cons 'gnutls-x509pki
-                     (gnutls-boot-parameters
-                      :type 'gnutls-x509pki :hostname host
-                      :verify-error nil :complete-negotiation t)))))
+                     (let ((gnutls-verify-error nil))
+                       (gnutls-boot-parameters
+                        :type 'gnutls-x509pki :hostname host
+                        :verify-error nil :complete-negotiation t))))))
     (condition-case err
         (let* ((status (and (process-live-p proc) (gnutls-peer-status proc)))
                (protocol (plist-get status :protocol))

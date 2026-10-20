@@ -3006,10 +3006,15 @@ the transport with nothing written and is terminal; a match — given in
 GnuTLS's spelling — sends the hello inside a TLS 1.3 stream.  The digest
 the pin is checked against was computed by openssl, so this also witnesses
 that GnuTLS's `:public-key-id-sha256' is the SPKI SHA-256 the spec names."
-  (skip-unless (and (fboundp 'gnutls-available-p) (gnutls-available-p)
+  (skip-unless (and (gnutls-available-p)
                     (executable-find "openssl") (executable-find "python3")))
   (pcase-let* ((`(,dir ,cert ,key ,digest) (ebp-test--tls-fixture))
-               (`(,server ,port ,buf) (ebp-test--start-tls-server cert key 2)))
+               (`(,server ,port ,buf) (ebp-test--start-tls-server cert key 2))
+               ;; The pin is the whole verification: a hardened init.el
+               ;; (`gnutls-verify-error' t) must not make the self-signed
+               ;; per-pairing certificate fail CA validation before the pin
+               ;; is ever compared.
+               (gnutls-verify-error t))
     (unwind-protect
         (progn
           ;; 1. Wrong pin: refused, silent, terminal.
