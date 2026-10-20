@@ -2899,6 +2899,14 @@ client, store, or socket exists — never a client left redialing."
                              :type 'error)))
       (should (string-search "(require 'ebp-tls)" (error-message-string err))))))
 
+(ert-deftest ebp-test-core-does-not-load-binder-machinery ()
+  "The SPEC 5.7 pool and strict receiver are `ebp-binder', loaded by the
+binder profile modules; a dialing Emacs — this suite loads only the core,
+the wire layer, and the store — never carries them."
+  (should-not (featurep 'ebp-binder))
+  (should-not (fboundp 'ebp--make-binder))
+  (should-not (fboundp 'ebp--receive-strict)))
+
 (ert-deftest ebp-test-mandatory-dialers-are-registry-entries ()
   "SPEC 5.2/5.3: the two mandatory dialers plug into the same registry a
 module-provided profile does — a `:open' that returns the socket — so the

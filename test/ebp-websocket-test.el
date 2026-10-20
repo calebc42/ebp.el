@@ -13,6 +13,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'ebp)
+(require 'ebp-binder) ; `ebp-binder-max-pending' and the deadline are let-bound below
 (require 'ebp-test-common)
 (require 'websocket)
 (require 'ebp-websocket)

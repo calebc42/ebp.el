@@ -9,9 +9,10 @@ framing, the JSON-RPC envelope, pairing proofs, and the session state step.
 `lisp/ebp.el` is the client engine on top of it: authentication, sessions,
 protocol dispatch, revisions, receipts, transports, and module plumbing.  The
 other `ebp-*.el` files are reusable endpoint modules for synchronization,
-completion, sandboxed paths, durable receipt/work storage, and the optional
-transport profiles (`ebp-tls.el`, `ebp-websocket.el`, `ebp-unix.el`).  None
-may depend on Jetpacs or another application.
+completion, sandboxed paths, durable receipt/work storage, the optional
+transport profiles (`ebp-tls.el`, `ebp-websocket.el`, `ebp-unix.el`), and the
+pre-authentication pool and strict receiver the listening profiles share
+(`ebp-binder.el`).  None may depend on Jetpacs or another application.
 
 Run the standalone gate with:
 

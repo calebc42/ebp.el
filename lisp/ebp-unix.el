@@ -20,8 +20,8 @@
 ;; 10 s deadline and newest-wins eviction, supersession by the newest
 ;; AUTHENTICATED connection — and what SPEC 5.6 requires of a binding
 ;; Emacs's receiver — the strict SPEC 6.2/4.1 decoder, REQUIRED here where
-;; a dialing Emacs may rent jsonrpc.el's tolerances — live in ebp.el as
-;; the `ebp--binder-*' pool and `ebp--strict-process-connection', shared
+;; a dialing Emacs may rent jsonrpc.el's tolerances — live in ebp-binder.el
+;; as the `ebp--binder-*' pool and `ebp--strict-process-connection', shared
 ;; with the SPEC 5.5 WebSocket binder.  This file adds the socket: path
 ;; policy, stale-socket handling, accept, and close.
 ;;
@@ -36,6 +36,7 @@
 (require 'jsonrpc)
 (require 'ebp-wire)                     ; framing, limits, `ebp-frame-close'
 (require 'ebp)
+(require 'ebp-binder)                   ; the shared SPEC 5.7 pool and strict receiver
 (require 'server)                       ; `server-ensure-safe-dir'
 
 ;;;; User options

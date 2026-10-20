@@ -24,8 +24,9 @@
 ;; newest-wins eviction, and supersession by the newest AUTHENTICATED
 ;; connection.
 ;;
-;; Everything above the socket is ebp.el's: each accepted connection runs
-;; the ordinary handshake driver on a CANDIDATE client
+;; Everything above the socket is ebp.el's and ebp-binder.el's: each
+;; accepted connection enters the shared SPEC 5.7 pool and runs the
+;; ordinary handshake driver on a CANDIDATE client
 ;; (`ebp-client--make-candidate'), and at welcome-verified
 ;; `ebp-client--adopt' promotes it into the logical client the
 ;; application holds.  Dispatch, overload accounting, receipts, editor
@@ -38,6 +39,7 @@
 (require 'jsonrpc)
 (require 'ebp-wire)                     ; framing, limits, `ebp-frame-close'
 (require 'ebp)
+(require 'ebp-binder)                   ; the shared SPEC 5.7 pool
 
 ;; SPEC 5.5 needs RFC 6455, which Emacs does not ship.  Fail loudly at
 ;; load — never silently — when the package is absent (AGENTS.md).
@@ -89,7 +91,7 @@ keeps the connection open, so the once-per-connection latch cannot serve.")
 ;;;; Listener state
 
 (defun ebp-websocket--listener (client)
-  "CLIENT's `ebp--binder' (ebp.el's shared SPEC 5.7 pool), or nil."
+  "CLIENT's `ebp--binder' (ebp-binder.el's shared SPEC 5.7 pool), or nil."
   (ebp--binder client))
 
 (defun ebp-websocket--close-socket (socket)
