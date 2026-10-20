@@ -34,6 +34,7 @@
 
 (require 'cl-lib)
 (require 'jsonrpc)
+(require 'ebp-wire)                     ; framing, limits, `ebp-frame-close'
 (require 'ebp)
 (require 'server)                       ; `server-ensure-safe-dir'
 

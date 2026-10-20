@@ -13,6 +13,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'ebp-wire)
 (require 'ebp)
 (require 'ebp-sqlite) ; these tests inspect the default backend
 (require 'ebp-test-common)

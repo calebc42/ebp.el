@@ -4,11 +4,13 @@ Canonical Emacs 30.1+ implementation of the Emacs Bridge Protocol (EBP).
 The normative protocol, machine-readable contract, and conformance goldens
 live in the neighboring [`ebp`](../ebp) repository.
 
-`lisp/ebp.el` owns transport framing, authentication, sessions, protocol
-dispatch, revisions, receipts, and module plumbing.  The other `ebp-*.el`
-files are reusable endpoint modules for synchronization, completion, sandboxed
-paths, and durable receipt/work storage.  None may depend on Jetpacs or another
-application.
+`lisp/ebp-wire.el` is the pure wire layer: JSON receiver rules, Content-Length
+framing, the JSON-RPC envelope, pairing proofs, and the session state step.
+`lisp/ebp.el` is the client engine on top of it: authentication, sessions,
+protocol dispatch, revisions, receipts, transports, and module plumbing.  The
+other `ebp-*.el` files are reusable endpoint modules for synchronization,
+completion, sandboxed paths, durable receipt/work storage, and the optional
+transport profiles.  None may depend on Jetpacs or another application.
 
 Run the standalone gate with:
 

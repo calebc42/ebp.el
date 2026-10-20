@@ -36,6 +36,7 @@
 
 (require 'cl-lib)
 (require 'jsonrpc)
+(require 'ebp-wire)                     ; framing, limits, `ebp-frame-close'
 (require 'ebp)
 
 ;; SPEC 5.5 needs RFC 6455, which Emacs does not ship.  Fail loudly at
