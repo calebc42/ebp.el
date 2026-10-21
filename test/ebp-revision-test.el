@@ -315,5 +315,44 @@
                            (ebp-store-surface-floors store (make-string 32 ?d)))))
         (ebp-store-close store)))))
 
+(ert-deftest ebp-revision-absorb-at-the-known-floor-commits-nothing ()
+  "A result that reports the reserved revision costs no second commit.
+The reservation committed that very floor before the send; absorbing it
+is a lookup.  Only a report ABOVE the known floor — store divergence —
+reaches the store, and a lower one never does."
+  (ebp-revision-test--with-file (file)
+    (let* ((client (ebp-revision-test--client file))
+           (raises 0)
+           (orig (symbol-function 'ebp-store-raise-floor))
+           (callback nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'ebp-store-raise-floor)
+                     (lambda (&rest args) (cl-incf raises) (apply orig args)))
+                    ((symbol-function 'ebp-client--request)
+                     (lambda (_c _method _params cb &optional _t)
+                       (setq callback cb))))
+            ;; The push: one commit, the reservation.
+            (should (= 0 (ebp-client-surface-update
+                          client "app:main" '(:t "text" :text "hi"))))
+            (should (= 1 raises))
+            ;; The applied result names that revision: no second commit,
+            ;; and the floor it reports is what memory and disk hold.
+            (funcall callback '(:status "applied" :revision 0 :present t) nil)
+            (should (= 1 raises))
+            (should (= 0 (ebp-client--surface-floor client "app:main")))
+            (should (equal '(("app:main" . 0)) (ebp-revision-test--floors file)))
+            ;; A stale result below the floor commits nothing either.
+            (should (= 0 (ebp-client--absorb-floor client "app:main" -1)))
+            (should (= 1 raises))
+            ;; A report above the known floor is divergence: committed.
+            (should (= 5 (ebp-client--absorb-floor client "app:main" 5)))
+            (should (= 2 raises))
+            (should (equal '(("app:main" . 5)) (ebp-revision-test--floors file)))
+            ;; The next push climbs above it, through one commit again.
+            (should (= 6 (ebp-client-surface-update
+                          client "app:main" '(:t "text" :text "again"))))
+            (should (= 3 raises)))
+        (ebp-client-close client 'test-done)))))
+
 (provide 'ebp-revision-test)
 ;;; ebp-revision-test.el ends here

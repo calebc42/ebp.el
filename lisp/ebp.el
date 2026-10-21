@@ -2721,18 +2721,29 @@ If the commit fails the client is closed with reason
 \(revision-persistence-failed SURFACE MESSAGE) and nothing is signaled:
 an endpoint that cannot remember a floor could author below it after a
 restart, so a closed client is the fail-closed outcome.  Returns the
-absorbed floor, or nil when the client was closed."
-  (let ((floor (max revision (ebp-client--surface-floor client surface))))
-    (condition-case err
-        (progn
-          (setq floor (max floor
-                           (ebp-client--persist-floor client surface floor)))
-          (puthash surface floor (ebp-client-revisions client))
-          floor)
-      (ebp-store-error
-       (ebp-client-close client (list 'revision-persistence-failed surface
-                                      (error-message-string err)))
-       nil))))
+absorbed floor, or nil when the client was closed.
+
+A report at or below the floor already in memory commits nothing: every
+writer of that table commits before it writes — the send-time
+reservation in `ebp-client--surface-request', a welcome or result floor
+absorbed here, the restore at open — so what it holds is durable
+already.  The ordinary applied result reports exactly the revision the
+reservation committed one hop earlier; answering it with a second
+commit was one fsync per push that persisted nothing new."
+  (let* ((known (ebp-client--surface-floor client surface))
+         (floor (max revision known)))
+    (if (<= floor known)
+        floor
+      (condition-case err
+          (progn
+            (setq floor (max floor
+                             (ebp-client--persist-floor client surface floor)))
+            (puthash surface floor (ebp-client-revisions client))
+            floor)
+        (ebp-store-error
+         (ebp-client-close client (list 'revision-persistence-failed surface
+                                        (error-message-string err)))
+         nil)))))
 
 (defun ebp-client--surface-request (client method surface params callback
                                            &optional on-claim)
