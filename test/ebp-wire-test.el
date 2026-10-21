@@ -180,6 +180,165 @@ character count, and our encoder reproduces the octet count exactly."
     (let ((reframed (ebp-encode-frame body-text)))
       (should (equal reframed bytes)))))
 
+;;;; Framing fuzz (SPEC 6.2, 4.1): the outcome set is closed
+
+;; Every test above pins a fault someone thought of to the outcome SPEC
+;; 6.2 assigns it.  This section asks the question none of them can: is
+;; there a FIFTH outcome?  Random mutations of valid frames are fed to a
+;; fresh decoder, and the only thing asserted is closure — every input ends
+;; in a list of decoded messages or one of the four spec'd signals, never a
+;; raw Lisp error, never a hang.  The generator is seeded, so a failure
+;; reproduces; the failing input is printed as a unibyte literal.
+
+(defconst ebp-test--fuzz-iterations 1500
+  "Mutations per fuzz test; a few seconds under `emacs --batch'.")
+
+(defun ebp-test--fuzz-seeds ()
+  "Valid unibyte frame streams to mutate: every goldens/wire fixture plus
+every frames.golden body framed by this encoder."
+  (let ((seeds '()))
+    (dolist (file (directory-files
+                   (expand-file-name "goldens/wire" ebp-test--ebp) t "\\.bin\\'"))
+      (push (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert-file-contents-literally file)
+              (buffer-string))
+            seeds))
+    (with-temp-buffer
+      (insert-file-contents (expand-file-name "goldens/frames.golden" ebp-test--ebp))
+      (dolist (line (split-string (buffer-string) "\n" t))
+        (when (string-match "\\`[0-9][0-9] \\(.*\\)\\'" line)
+          (push (ebp-encode-frame (match-string 1 line)) seeds))))
+    (dolist (s seeds) (should-not (multibyte-string-p s)))
+    seeds))
+
+(defun ebp-test--fuzz-byte ()
+  "A random octet biased toward the characters framing cares about."
+  (pcase (random 6)
+    (0 (let ((hot "\r\n: {}[]\",\\0123456789")) (aref hot (random (length hot)))))
+    (1 (random 32))                     ; control octets
+    (2 (+ 128 (random 128)))            ; non-ASCII, mostly invalid UTF-8
+    (_ (random 256))))
+
+(defun ebp-test--fuzz-mutate (bytes)
+  "One random structural or byte-level mutation of unibyte BYTES."
+  (let* ((n (length bytes))
+         (i (if (> n 0) (random n) 0))
+         (j (if (> n 0) (random n) 0))
+         (out
+          (pcase (random 9)
+            (0 (if (zerop n) bytes       ; flip one octet
+                 (concat (substring bytes 0 i) (unibyte-string (ebp-test--fuzz-byte))
+                         (substring bytes (1+ i)))))
+            (1 (concat (substring bytes 0 i) (unibyte-string (ebp-test--fuzz-byte))
+                       (substring bytes i)))             ; insert one octet
+            (2 (if (zerop n) bytes                        ; delete one octet
+                 (concat (substring bytes 0 i) (substring bytes (1+ i)))))
+            (3 (substring bytes 0 i))                     ; truncate
+            (4 (concat (substring bytes 0 (max i j))      ; duplicate a span
+                       (substring bytes (min i j) (max i j))
+                       (substring bytes (max i j))))
+            (5 (concat (substring bytes 0 i) "\r\n\r\n" (substring bytes i)))
+            (6 (concat (substring bytes 0 i)              ; a second header line
+                       (unibyte-string ?\r ?\n) "Content-Length: "
+                       (number-to-string (random 5000000)) (substring bytes i)))
+            (7 (concat bytes bytes))                      ; two frames, pipelined
+            (_ (let ((k (random 4)))                      ; several mutations
+                 (dotimes (_ k) (setq bytes (ebp-test--fuzz-mutate bytes)))
+                 bytes)))))
+    (should-not (multibyte-string-p out))
+    out))
+
+(defun ebp-test--fuzz-chunks (bytes)
+  "Split BYTES at random points, so partial-frame retention is exercised."
+  (let ((chunks '()) (i 0) (n (length bytes)))
+    (while (< i n)
+      (let ((end (min n (+ i 1 (random 40)))))
+        (push (substring bytes i end) chunks)
+        (setq i end)))
+    (nreverse chunks)))
+
+(defconst ebp-test--fuzz-outcomes
+  '(ebp-frame-close ebp-frame-incomplete ebp-parse-error ebp-invalid-request)
+  "SPEC 6.2's complete receiver outcome set, besides decoding.")
+
+(defun ebp-test--fuzz-outcome (chunks)
+  "Feed CHUNKS to a fresh decoder; return `ok', a spec'd signal symbol, or
+\(unexpected . ERR) for anything else."
+  (condition-case err
+      (let ((dec (ebp-make-decoder)))
+        (dolist (c chunks) (ebp-decoder-feed dec c))
+        (ebp-decoder-finish dec)
+        'ok)
+    (error (if (memq (car err) ebp-test--fuzz-outcomes)
+               (car err)
+             (cons 'unexpected err)))))
+
+(ert-deftest ebp-test-fuzz-decoder-outcomes-are-closed ()
+  "SPEC 6.2: for arbitrary input the receiver reaches exactly one of five
+terminal outcomes — decoded messages or the four signals — never a raw
+Lisp error.  Also: feeding the same bytes whole and in random chunks
+yields the same outcome (partial-frame retention is invisible)."
+  (random "ebp-fuzz-decoder")
+  (let ((seeds (ebp-test--fuzz-seeds)))
+    (dotimes (k ebp-test--fuzz-iterations)
+      (let* ((input (ebp-test--fuzz-mutate (nth (random (length seeds)) seeds)))
+             (whole (ebp-test--fuzz-outcome (list input)))
+             (chunked (ebp-test--fuzz-outcome (ebp-test--fuzz-chunks input))))
+        (when (or (consp whole) (consp chunked) (not (eq whole chunked)))
+          (ert-fail (format "iteration %d: whole=%S chunked=%S input=%S"
+                            k whole chunked input)))))))
+
+(ert-deftest ebp-test-fuzz-decoder-is-deterministic-and-exact ()
+  "A valid frame stream decodes to the same messages whole and chunked,
+and a frame's declared length is honored exactly: appending octets after
+a complete frame never alters the messages decoded before them."
+  (random "ebp-fuzz-exact")
+  (let ((seeds (ebp-test--fuzz-seeds)))
+    (dotimes (_ 200)
+      (let* ((bytes (nth (random (length seeds)) seeds))
+             (whole (ebp-test--run-fixture bytes))
+             (chunked (ebp-test--run-fixture-chunked (ebp-test--fuzz-chunks bytes))))
+        (should (equal whole chunked))
+        (when (car whole)
+          ;; Trailing garbage after a complete stream: the earlier
+          ;; messages still decode, whatever happens to the tail.
+          (let* ((tail (ebp-test--fuzz-mutate (unibyte-string ?x)))
+                 (dec (ebp-make-decoder))
+                 (got (condition-case nil
+                          (prog1 (ebp-decoder-feed dec (concat bytes tail))
+                            (ebp-decoder-finish dec))
+                        ((ebp-frame-close ebp-frame-incomplete ebp-parse-error
+                                          ebp-invalid-request)
+                         'faulted))))
+            (unless (eq got 'faulted)
+              (should (equal (seq-take got (length (car whole))) (car whole))))))))))
+
+(ert-deftest ebp-test-fuzz-body-codecs-are-closed-and-agree ()
+  "SPEC 4.1: for arbitrary body text both codecs reach `ebp-parse-error',
+`ebp-invalid-request', or a value — never a raw Lisp error — and they
+reach the SAME outcome, since `ebp--parse-checked' is their one rulebook."
+  (random "ebp-fuzz-bodies")
+  (let ((bodies (with-temp-buffer
+                  (insert-file-contents
+                   (expand-file-name "goldens/frames.golden" ebp-test--ebp))
+                  (cl-loop for line in (split-string (buffer-string) "\n" t)
+                           when (string-match "\\`[0-9][0-9] \\(.*\\)\\'" line)
+                           collect (encode-coding-string (match-string 1 line) 'utf-8)))))
+    (dotimes (k ebp-test--fuzz-iterations)
+      (let* ((input (ebp-test--fuzz-mutate (nth (random (length bodies)) bodies)))
+             (outcome (lambda (fn)
+                        (condition-case err
+                            (progn (funcall fn input) 'ok)
+                          (error (if (memq (car err) '(ebp-parse-error ebp-invalid-request))
+                                     (car err)
+                                   (cons 'unexpected err))))))
+             (alist (funcall outcome #'ebp--parse-body))
+             (plist (funcall outcome #'ebp--parse-message)))
+        (when (or (consp alist) (consp plist) (not (eq alist plist)))
+          (ert-fail (format "iteration %d: alist=%S plist=%S input=%S"
+                            k alist plist input)))))))
+
 ;;;; Encoder syntax (SPEC 6.1)
 
 (ert-deftest ebp-test-encoder-syntax ()
