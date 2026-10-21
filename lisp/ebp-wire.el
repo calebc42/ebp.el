@@ -51,7 +51,10 @@
 ;;;; JSON (SPEC 4.1)
 
 (defun ebp--json-parse (text)
-  "Parse TEXT as JSON, returning alists/lists.  Signals `ebp-parse-error'."
+  "Parse TEXT as JSON, returning alists/lists.  Signals `ebp-parse-error'.
+The reference codec's switches; `ebp--parse-body' passes the same four to
+`ebp--parse-checked', and `ebp--duplicate-members-p' decodes key tokens
+through this function so escaped and literal spellings of one key meet."
   (condition-case nil
       (json-parse-string text :object-type 'alist :array-type 'list
                          :null-object :null :false-object :false)
@@ -220,62 +223,57 @@ Return the declared body length or signal `ebp-frame-close' (SPEC 6.2)."
         (signal 'ebp-frame-close (list "oversized body declaration")))
       len)))
 
+(defun ebp--parse-checked (text object-type array-type null-object false-object)
+  "Parse TEXT under the SPEC 4.1/6.2 receiver rules; return the decoded value.
+The one rulebook both body codecs share, so the reference decoder the
+tests speak and the live decoder a binding Emacs runs cannot drift apart:
+the SPEC 4.5 depth cap BEFORE the recursive parser runs (SPEC 23.5:
+enforcement precedes expensive decoding), valid JSON, a single top-level
+object, no duplicate member names (SPEC 4.1), and no numbers the data
+model cannot carry (SPEC 4.2, amendment #99).  OBJECT-TYPE, ARRAY-TYPE,
+NULL-OBJECT and FALSE-OBJECT are `json-parse-string's codec switches and
+decide only the SHAPE of the result, never what is accepted.
+
+The object test reads the first non-whitespace character rather than the
+decoded shape: under either codec `{}' and `null' both decode to nil, and
+under the alist codec `[]' does too, so the shape alone cannot tell a
+valid (if useless) message object from a prohibited batch or scalar; the
+text can.  Signals `ebp-parse-error' or `ebp-invalid-request'."
+  (when (ebp--exceeds-depth-p text)
+    (signal 'ebp-parse-error (list "nesting depth exceeds 64")))
+  (let ((value (condition-case nil
+                   (json-parse-string text :object-type object-type
+                                      :array-type array-type
+                                      :null-object null-object
+                                      :false-object false-object)
+                 (error (signal 'ebp-parse-error (list "invalid JSON"))))))
+    (let ((lead (string-trim-left text)))
+      (unless (and (> (length lead) 0) (eq (aref lead 0) ?{))
+        (signal 'ebp-invalid-request (list "top-level value is not an object"))))
+    (when (ebp--duplicate-members-p text)
+      (signal 'ebp-invalid-request (list "duplicate member names")))
+    (ebp--check-numbers value)
+    value))
+
 (defun ebp--parse-body (bytes)
-  "Decode one complete frame body BYTES into a message object.
-SPEC 6.2 + 4.1: strict UTF-8, valid JSON, single top-level object,
-no duplicate member names."
-  (let ((text (ebp--decode-utf-8 bytes)))
-    ;; SPEC 4.5/23.5: refuse an over-deep body before the recursive parser
-    ;; can exhaust the stack — enforcement precedes expensive decoding.
-    (when (ebp--exceeds-depth-p text)
-      (signal 'ebp-parse-error (list "nesting depth exceeds 64")))
-    (let ((value (ebp--json-parse text)))
-      (unless (and (listp value) (or (null value) (consp (car value))))
-        ;; Top-level arrays (batches) and scalars are prohibited.
-        (signal 'ebp-invalid-request (list "top-level value is not an object")))
-      ;; `nil' parses ambiguously ({} and [] both -> nil); {} is a valid
-      ;; (if useless) message object, [] is a prohibited batch.  Disambiguate
-      ;; on the first non-whitespace character.
-      (when (and (null value)
-                 (eq (aref (string-trim-left text) 0) ?\[))
-        (signal 'ebp-invalid-request (list "batch arrays are prohibited")))
-      (when (ebp--duplicate-members-p text)
-        (signal 'ebp-invalid-request (list "duplicate member names")))
-      ;; SPEC 4.2 (amendment #99): numbers this data model cannot carry.
-      (ebp--check-numbers value)
-      value)))
+  "Decode one complete frame body BYTES into a message object (reference codec).
+Objects decode as alists, arrays as lists, `null' as `:null' and `false'
+as `:false' — the same codec as `ebp--json-parse', the readable shape the
+conformance goldens and the test suites' Companion receiver compare
+against.  The receiver rules are `ebp--parse-checked's."
+  (ebp--parse-checked (ebp--decode-utf-8 bytes) 'alist 'list :null :false))
 
 (defun ebp--parse-message (bytes)
   "Decode one complete message body BYTES into a jsonrpc-style keyword plist.
-The SPEC 4.1/6.2 receiver rules `ebp--parse-body' applies for the
-reference alist codec, applied to the live shape `jsonrpc-connection-receive'
-dispatches: strict UTF-8, the 4.5 depth cap before parsing, a single
-top-level object, no duplicate member names, no numbers the data model
-cannot carry.  Arrays decode as vectors, `null' as nil, and `false' as
-`:json-false', exactly as jsonrpc.el's own decoder does.  Signals
-`ebp-parse-error' or `ebp-invalid-request'.  SPEC 23.5: the CALLER binds
-a throwaway `obarray' around this call and runs `ebp--remap-decoded' on
-the result outside it, as the process-filter wrapper in
-`ebp-client--open-dialer-transport' does for jsonrpc.el's parse."
-  (let ((text (ebp--decode-utf-8 bytes)))
-    (when (ebp--exceeds-depth-p text)
-      (signal 'ebp-parse-error (list "nesting depth exceeds 64")))
-    (let ((value (condition-case nil
-                     (json-parse-string text :object-type 'plist
-                                        :array-type 'array
-                                        :null-object nil
-                                        :false-object :json-false)
-                   (error (signal 'ebp-parse-error (list "invalid JSON"))))))
-      ;; {} and null both decode to nil; [] is a vector.  The first
-      ;; non-whitespace character settles what the text actually was.
-      (unless (and (listp value)
-                   (let ((lead (string-trim-left text)))
-                     (and (> (length lead) 0) (eq (aref lead 0) ?{))))
-        (signal 'ebp-invalid-request (list "top-level value is not an object")))
-      (when (ebp--duplicate-members-p text)
-        (signal 'ebp-invalid-request (list "duplicate member names")))
-      (ebp--check-numbers value)
-      value)))
+The live shape `jsonrpc-connection-receive' dispatches: objects decode as
+plists, arrays as vectors, `null' as nil, and `false' as `:json-false',
+exactly as jsonrpc.el's own decoder does.  The receiver rules are
+`ebp--parse-checked's, shared with the reference codec.  SPEC 23.5: the
+CALLER binds a throwaway `obarray' around this call and runs
+`ebp--remap-decoded' on the result outside it, as the process-filter
+wrapper in `ebp-client--open-dialer-transport' does for jsonrpc.el's
+parse."
+  (ebp--parse-checked (ebp--decode-utf-8 bytes) 'plist 'array nil :json-false))
 
 (defun ebp--decoder-next (decoder)
   "Split the next complete frame off DECODER; return its unibyte body or nil.
