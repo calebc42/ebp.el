@@ -587,15 +587,21 @@ The handle stays valid: a failed query says nothing about the store."
            (pairing_id, created_at_ms) VALUES (?, ?)"
         (list pairing-id now-ms))
        ;; Floors only rise: an existing higher row keeps its revision.
+       ;; Insert-then-raise rather than an UPSERT: `ON CONFLICT DO UPDATE'
+       ;; needs SQLite 3.24, and Android Emacs links SQLite 3.9.  Inside the
+       ;; transaction the pair is the same single-row write.
        (sqlite-execute
         db
-        "INSERT INTO surface_floors
+        "INSERT OR IGNORE INTO surface_floors
            (pairing_id, surface, revision, updated_at_ms)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT (pairing_id, surface) DO UPDATE
-             SET revision = max(revision, excluded.revision),
-                 updated_at_ms = excluded.updated_at_ms"
+           VALUES (?, ?, ?, ?)"
         (list pairing-id surface revision now-ms))
+       (sqlite-execute
+        db
+        "UPDATE surface_floors
+            SET revision = max(revision, ?), updated_at_ms = ?
+          WHERE pairing_id = ? AND surface = ?"
+        (list revision now-ms pairing-id surface))
        (ebp-sqlite--fault 'after-floor-write)
        (let ((floor (ebp-sqlite--scalar
                      db
@@ -830,13 +836,15 @@ The handle stays valid: a failed query says nothing about the store."
        (lambda ()
          (sqlite-execute
           db
-          "DELETE FROM accepted_events AS e
-            WHERE e.completed_at_ms IS NOT NULL
-              AND e.accepted_at_ms <= ?
+          ;; No alias on the DELETE target: SQLite before 3.35 rejects
+          ;; `DELETE FROM t AS e', and Android Emacs links SQLite 3.9.
+          "DELETE FROM accepted_events
+            WHERE completed_at_ms IS NOT NULL
+              AND accepted_at_ms <= ?
               AND NOT EXISTS (
                     SELECT 1 FROM action_work AS w
-                     WHERE w.pairing_id = e.pairing_id
-                       AND w.event_id = e.event_id)"
+                     WHERE w.pairing_id = accepted_events.pairing_id
+                       AND w.event_id = accepted_events.event_id)"
           (list cutoff)))))))
 
 (cl-defmethod ebp-store-close ((store ebp-sqlite-store))
