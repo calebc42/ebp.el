@@ -313,6 +313,33 @@ re-sends identical content (the Companion discarded the old seq's)."
       (should (cl-find "comment" runs
                        :key (lambda (r) (plist-get r :role)) :test #'equal)))))
 
+(ert-deftest ebp-sync-fontify-heading-levels ()
+  "Outline faces, and faces inheriting them, report their depth."
+  (should (equal (ebp-sync--face-role-level 'outline-3) '("heading" . 3)))
+  (make-face 'ebp-sync-test--level-2)
+  (set-face-attribute 'ebp-sync-test--level-2 nil :inherit 'outline-2)
+  (should (equal (ebp-sync--face-role-level 'ebp-sync-test--level-2)
+                 '("heading" . 2)))
+  (should (equal (ebp-sync--face-role-level 'font-lock-keyword-face)
+                 '("keyword")))
+  (with-temp-buffer
+    (insert (propertize "* A" 'face 'outline-1)
+            (propertize "** B" 'face 'outline-2))
+    (should (equal (ebp-sync--fontify-runs)
+                   '((:start 0 :end 3 :role "heading" :level 1)
+                     (:start 3 :end 7 :role "heading" :level 2))))))
+
+(ert-deftest ebp-sync-fontify-function-replaces-the-face-walk ()
+  "A buffer-local runs function is the whole answer, widened."
+  (with-temp-buffer
+    (insert (propertize "abc" 'face 'font-lock-keyword-face))
+    (narrow-to-region 2 3)
+    (setq-local ebp-sync-fontify-function
+                (lambda () (list (list :start 0 :end (buffer-size)
+                                       :role "tag"))))
+    (should (equal (ebp-sync--fontify-runs)
+                   '((:start 0 :end 3 :role "tag"))))))
+
 (ert-deftest ebp-sync-fontify-push-dedupe-and-cap ()
   "Seq-stamped dedupe like diagnostics; oversized buffers push nothing."
   (ebp-sync-test--with "(defun foo ())"

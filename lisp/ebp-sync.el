@@ -1048,46 +1048,78 @@ Sync and diagnostics still work; only the highlighting stays local."
 Only faces Emacs itself ships (font-lock, outline, org, `link') appear;
 anything else resolves through its `:inherit' chain or ships unstyled.")
 
-(defun ebp-sync--face-role (face)
-  "The syntax role for text property FACE, or nil for unstyled.
+(defconst ebp-sync--heading-levels
+  '((outline-1 . 1) (outline-2 . 2) (outline-3 . 3) (outline-4 . 4)
+    (outline-5 . 5) (outline-6 . 6) (outline-7 . 7) (outline-8 . 8))
+  "Outline faces to the SPEC 19.5 heading `level' they name.
+Org's `org-level-N' faces inherit these, so they resolve here too.")
+
+(defun ebp-sync--face-role-level (face)
+  "The (ROLE . LEVEL) for text property FACE, or nil for unstyled.
 FACE may be a symbol, an anonymous plist, or a list of either; the
 first element that reaches a known face — directly or through
-`:inherit' — wins."
+`:inherit' — wins.  LEVEL is the outline depth of a heading face and
+nil for every other role."
   (catch 'role
     (dolist (f (if (and (listp face) (not (keywordp (car-safe face))))
                    face (list face)))
       (while (and f (symbolp f))
         (when-let* ((role (cdr (assq f ebp-sync--face-roles))))
-          (throw 'role role))
+          (throw 'role (cons role (cdr (assq f ebp-sync--heading-levels)))))
         (let ((parent (and (facep f) (face-attribute f :inherit))))
           (setq f (if (consp parent) (car parent) parent)
                 f (and (symbolp f) (not (eq f 'unspecified)) f)))))
     nil))
 
+(defun ebp-sync--face-role (face)
+  "The syntax role for text property FACE, or nil for unstyled.
+See `ebp-sync--face-role-level', which also reports a heading's depth."
+  (car (ebp-sync--face-role-level face)))
+
+(defvar-local ebp-sync-fontify-function nil
+  "Function that computes this buffer's `fontify.show' runs, or nil.
+nil walks the buffer's font-lock faces.  Otherwise it is called with no
+arguments in the buffer and returns SPEC 19.5 run plists — `:start',
+`:end', `:role' and, on a heading, an optional `:level' — over the
+whole widened buffer, with 0-based offsets, sorted and non-overlapping.
+An applet sets it to present a document in its own design language
+instead of the user's Emacs theme.")
+
 (defun ebp-sync--fontify-runs ()
   "The buffer's face runs as SPEC 19.5 wire plists.
 Sorted and non-overlapping by construction (a walk over face property
 changes); adjacent same-role runs merge; unstyled stretches ship
-nothing.  WIDENED: the offsets were always absolute, so nothing was
-ever misplaced here — but `font-lock-ensure' and the walk both stopped
+nothing.  A heading run carries its outline depth as `:level'.  A
+buffer's `ebp-sync-fontify-function' replaces the face walk.
+
+WIDENED: the offsets were always absolute, so nothing was ever
+misplaced here — but `font-lock-ensure' and the walk both stopped
 at the restriction, and the phone renders the whole document, so
 everything outside the user's narrowing arrived unstyled."
   (save-restriction
     (widen)
     (ignore-errors (font-lock-ensure))
-    (let ((pos (point-min)) runs)
-      (while (< pos (point-max))
-        (let ((next (next-single-property-change pos 'face nil (point-max)))
-              (role (ebp-sync--face-role (get-text-property pos 'face))))
-          (when role
-            (let ((prev (car runs)))
-              (if (and prev (equal (plist-get prev :role) role)
-                       (= (plist-get prev :end) (1- pos)))
-                  (setf (car runs) (plist-put prev :end (1- next)))
-                (push (list :start (1- pos) :end (1- next) :role role)
-                      runs))))
-          (setq pos next)))
-      (nreverse runs))))
+    (if ebp-sync-fontify-function
+        (funcall ebp-sync-fontify-function)
+      (let ((pos (point-min)) runs)
+        (while (< pos (point-max))
+          (let* ((next (next-single-property-change pos 'face nil (point-max)))
+                 (found (ebp-sync--face-role-level
+                         (get-text-property pos 'face)))
+                 (role (car found))
+                 (level (cdr found)))
+            (when role
+              (let ((prev (car runs)))
+                (if (and prev (equal (plist-get prev :role) role)
+                         (equal (plist-get prev :level) level)
+                         (= (plist-get prev :end) (1- pos)))
+                    (setf (car runs) (plist-put prev :end (1- next)))
+                  (push (append (list :start (1- pos) :end (1- next)
+                                      :role role)
+                                (and level (list :level level)))
+                        runs))))
+            (setq pos next)))
+        (nreverse runs)))))
 
 (defun ebp-sync--arm-fontify (buffer)
   "(Re)start BUFFER's fontify push timer after an accepted change."
