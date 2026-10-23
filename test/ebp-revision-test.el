@@ -319,16 +319,21 @@
   "A result that reports the reserved revision costs no second commit.
 The reservation committed that very floor before the send; absorbing it
 is a lookup.  Only a report ABOVE the known floor — store divergence —
-reaches the store, and a lower one never does."
+reaches the store, and a lower one never does.
+
+The count is an advice, not a `cl-letf' of the function cell:
+`ebp-store-raise-floor' is a generic function, and its first dispatch
+compiles and re-installs its dispatcher, overwriting a stubbed cell.
+The stub then saw only the first raise, so the witness passed or failed
+by whether an earlier test had already warmed the generic."
   (ebp-revision-test--with-file (file)
     (let* ((client (ebp-revision-test--client file))
            (raises 0)
-           (orig (symbol-function 'ebp-store-raise-floor))
+           (count (lambda (&rest _) (cl-incf raises)))
            (callback nil))
+      (advice-add 'ebp-store-raise-floor :before count)
       (unwind-protect
-          (cl-letf (((symbol-function 'ebp-store-raise-floor)
-                     (lambda (&rest args) (cl-incf raises) (apply orig args)))
-                    ((symbol-function 'ebp-client--request)
+          (cl-letf (((symbol-function 'ebp-client--request)
                      (lambda (_c _method _params cb &optional _t)
                        (setq callback cb))))
             ;; The push: one commit, the reservation.
@@ -352,6 +357,7 @@ reaches the store, and a lower one never does."
             (should (= 6 (ebp-client-surface-update
                           client "app:main" '(:t "text" :text "again"))))
             (should (= 3 raises)))
+        (advice-remove 'ebp-store-raise-floor count)
         (ebp-client-close client 'test-done)))))
 
 (provide 'ebp-revision-test)
