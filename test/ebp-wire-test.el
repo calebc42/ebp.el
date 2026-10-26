@@ -1297,6 +1297,26 @@ welcome mirror lands through the same slot."
     (should (equal (plist-get (ebp-client-locale client) :hour_cycle) "h12"))
     (should (equal (length seen) 2))))
 
+(ert-deftest ebp-test-colors-changed-is-stored-and-fanned-out ()
+  "SPEC 20.1.3 (#205): the receiver stores the device colors and runs
+`colors-changed-functions'; nothing is dispatched or persisted, and the
+welcome mirror lands through the same slot."
+  (let* ((client (ebp-test--store-client))
+         (seen nil)
+         (colors '(:polarity "dark"
+                   :light (:primary "#396286" :surface_container_low "#f1f4fa")
+                   :dark (:primary "#b4c5ff" :surface_container_low "#1a1b20"))))
+    (push (lambda (c plist) (push (cons c plist) seen))
+          (ebp-client-colors-changed-functions client))
+    (should (null (ebp-client-colors client)))
+    (ebp-client--handle-colors-changed client colors)
+    (should (equal (ebp-client-colors client) colors))
+    (should (equal seen (list (cons client colors))))
+    (ebp-client--handle-colors-changed
+     client '(:polarity "light" :light (:primary "#396286") :dark (:primary "#b4c5ff")))
+    (should (equal (plist-get (ebp-client-colors client) :polarity) "light"))
+    (should (equal (length seen) 2))))
+
 (ert-deftest ebp-test-reset-history-precedes-the-send ()
   "A8/H1: a send is NOT atomic with respect to our own state.
 `process-send-string' on a frame large enough to fill the socket buffer

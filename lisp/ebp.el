@@ -762,6 +762,12 @@ them.")
   ;; its own locale.
   locale
   locale-changed-functions ; called with (client locale-plist)
+  ;; SPEC 20.1.3 (#205): the last-reported device colors plist
+  ;; (:polarity :light :dark), from the welcome mirror and every
+  ;; colors.changed since; nil while unknown, when Emacs falls back to
+  ;; its own palette.
+  colors
+  colors-changed-functions ; called with (client colors-plist)
   ;; SPEC 19: Emacs's mirror of synchronized editors, (doc . id) ->
   ;; plist (:session :seq :text :cursor).  Emacs chars ARE Unicode
   ;; scalar values, so splice positions are char positions directly.
@@ -864,6 +870,8 @@ Receipts are partitioned by :pairing-id (SPEC 14.4)."
                                  #'ebp-client--handle-window-changed)
     (ebp-client-register-handler client "locale.changed"
                                  #'ebp-client--handle-locale-changed)
+    (ebp-client-register-handler client "colors.changed"
+                                 #'ebp-client--handle-colors-changed)
     (when-let* ((fn (plist-get config :edit-change-function)))
       (push fn (ebp-client-edit-change-functions client)))
     (when-let* ((fn (plist-get config :edit-splice-function)))
@@ -956,6 +964,7 @@ session identities do not."
         (ebp-client-device client) nil
         (ebp-client-window client) nil
         (ebp-client-locale client) nil
+        (ebp-client-colors client) nil
         (ebp-client-replay-summary client) nil
         (ebp-client-outstanding client) 0
         (ebp-client-outstanding-held client) nil
@@ -1099,6 +1108,7 @@ bypasses the pure machine; the candidate reached `syncing' through
               (ebp-client-device parent) (ebp-client-device client)
               (ebp-client-window parent) (ebp-client-window client)
               (ebp-client-locale parent) (ebp-client-locale client)
+              (ebp-client-colors parent) (ebp-client-colors client)
               (ebp-client-outstanding parent) (ebp-client-outstanding client)
               (ebp-client-outstanding-held parent) (ebp-client-outstanding-held client)
               (ebp-client-inbound-paused parent) (ebp-client-inbound-paused client)
@@ -1782,7 +1792,10 @@ synchronization barrier (SPEC 10.3)."
           (ebp-client-window client) (plist-get result :window)
           ;; SPEC 20.1.2: the welcome's locale mirror — presentation
           ;; advice for the device's clock cycle and civil day.
-          (ebp-client-locale client) (plist-get result :locale))
+          (ebp-client-locale client) (plist-get result :locale)
+          ;; SPEC 20.1.3 (#205): the welcome's colors mirror — the device's
+          ;; own scheme, so the FIRST snapshot can be authored in it.
+          (ebp-client-colors client) (plist-get result :colors))
     ;; Reported floors cover snapshots AND tombstones (SPEC 10.2/13.3).
     ;; Each is absorbed — persisted, and only ever rising — rather than
     ;; installed verbatim: a floor this endpoint persisted in a previous
@@ -2241,6 +2254,16 @@ clocks and civil days for the device.  Presentation advice, never an
 event: nothing here dispatches, persists, or acknowledges."
   (setf (ebp-client-locale client) params)
   (dolist (fn (ebp-client-locale-changed-functions client))
+    (funcall fn client params)))
+
+(defun ebp-client--handle-colors-changed (client params)
+  "The `colors.changed' receiver (SPEC 20.1.3, #205).
+Stores the device colors plist (:polarity :light :dark) and runs
+`colors-changed-functions' — the application's seam for re-authoring
+its palette for the device.  Presentation advice, never an event:
+nothing here dispatches, persists, or acknowledges."
+  (setf (ebp-client-colors client) params)
+  (dolist (fn (ebp-client-colors-changed-functions client))
     (funcall fn client params)))
 
 (defun ebp-client-input-caret (client surface id)
