@@ -1726,6 +1726,24 @@ locally with a synthetic 1201 editor-too-large; nothing reaches the wire."
       (should (equal (caar sent) 'edit.apply))
       (should (= (plist-get (cdar sent) :len) 7)))))
 
+(ert-deftest ebp-test-edit-apply-explicit-cursor ()
+  "An explicit :cursor places the device caret, clamped to the result:
+a requested insertion ends with the caret after the inserted text."
+  (let* ((sent nil)
+         (client (ebp-client-create
+                  :receipt-file (make-temp-file "ebp-test-receipts"))))
+    (puthash '("doc:1" . "body")
+             (list :session (make-string 32 ?0) :seq 0
+                   :text "0123456789" :cursor 4)
+             (ebp-client-editors client))
+    (cl-letf (((symbol-function 'ebp-client--request)
+               (lambda (_c method params _cb &optional _t)
+                 (push (cons method params) sent))))
+      (ebp-client-edit-apply client "doc:1" "body" 4 0 "abc" :cursor 7)
+      (should (= (plist-get (cdar sent) :cursor) 7))
+      (ebp-client-edit-apply client "doc:1" "body" 4 0 "abc" :cursor 99)
+      (should (= (plist-get (cdar sent) :cursor) 13)))))
+
 (ert-deftest ebp-test-edit-apply-cursor-marker-arithmetic ()
   "SPEC 19.4: `cursor' PLACES the device caret, so an Emacs apply must
 compute it from the device's last-known caret with marker arithmetic —

@@ -2547,14 +2547,17 @@ degrades to \"\", the MAY-be-empty arm, never -32603."
         (list :doc text)))))
 
 (cl-defun ebp-client-edit-apply (client document editor-id start del text
-                                 &key callback)
+                                 &key cursor callback)
   "SPEC 19.4: push an Emacs edit to the Companion; it wins seq+1 or loses
 with a typed stale (the incoming delta is then authoritative).
 Amendment #84: a splice whose resulting document would exceed the
 negotiated `max_editor_bytes' (its JCS-serialized UTF-8 length, SPEC
 4.5) MUST NOT be emitted; it is refused locally and CALLBACK receives
 \(nil ERROR) with a synthetic `1201' `editor-too-large' plist mirroring
-the wire shape."
+the wire shape.  CURSOR, when an integer, places the device caret
+explicitly — an insertion the user asked for lands with the caret
+after it, as typing would; otherwise the caret follows the splice by
+the marker arithmetic below."
   (let ((ed (gethash (cons document editor-id) (ebp-client-editors client))))
     (when ed
       (let* ((old (plist-get ed :text))
@@ -2587,7 +2590,9 @@ the wire shape."
                  ;; caret report's cursor is stored unvalidated, and
                  ;; arithmetic on a float would put a float on our wire.
                  (cursor (let ((known (plist-get ed :cursor)))
-                           (cond ((not (integerp known))
+                           (cond ((integerp cursor)
+                                  (min (max cursor 0) (length new)))
+                                 ((not (integerp known))
                                   (+ start (length text)))
                                  ((<= known start) known)
                                  ((<= known (+ start del))
